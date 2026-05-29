@@ -1,12 +1,18 @@
 # hyphasync roadmap
 
-Phase 0 (current) is an experimental scaffold: local DuckDB metadata only.
+## Completed
+
+### Phase 0 — local metadata scaffold
+
+- `hypha_hello()`, `hypha_doctor()`, `hypha_init()`
+- Local `hypha` schema and metadata tables (no remote I/O)
+
+### Phase 1 — Postgres attach and health checks
+
+- `hypha_attach_check(conn_string)` — read-only libpq probe (connect, `version()`, remote `hypha` schema inventory)
+- `NULL` or empty `conn_string` uses `hypha.target` default row
 
 ## Next phases
-
-### Postgres attach and health checks
-
-- `hypha_attach_check(conn_string)` — validate Postgres connectivity and permissions without mutating remote state beyond read-only probes.
 
 ### Remote hypha metadata
 

@@ -2,6 +2,7 @@
 
 #include "hyphasync_extension.hpp"
 #include "hypha_metadata.hpp"
+#include "hypha_postgres.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -40,8 +41,26 @@ static void HyphaInitFun(DataChunk &args, ExpressionState &state, Vector &result
 	});
 }
 
-// Phase 1+ roadmap (see docs/ROADMAP.md):
-// TODO: Postgres attach/check (hypha_attach_check)
+static void HyphaAttachCheckFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	Connection con(*context.db);
+
+	auto &input = args.data[0];
+	auto result_data = FlatVector::GetData<string_t>(result);
+
+	for (idx_t i = 0; i < args.size(); i++) {
+		std::string conn_string;
+		if (!input.GetValue(i).IsNull()) {
+			conn_string = input.GetValue(i).ToString();
+		}
+		if (conn_string.empty()) {
+			conn_string = GetDefaultTargetConnString(con);
+		}
+		result_data[i] = StringVector::AddString(result, RunHyphaAttachCheck(conn_string));
+	}
+}
+
+// Phase 2+ roadmap (see docs/ROADMAP.md):
 // TODO: remote hypha metadata on Postgres target
 // TODO: hypha_base_snapshot_plan(), hypha_base_snapshot()
 // TODO: object lineage comments and fingerprint/hashing capture
@@ -58,6 +77,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction hypha_init("hypha_init", {LogicalType::VARCHAR}, LogicalType::VARCHAR, HyphaInitFun);
 	hypha_init.SetStability(FunctionStability::VOLATILE);
 	loader.RegisterFunction(hypha_init);
+
+	ScalarFunction hypha_attach_check("hypha_attach_check", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                                  HyphaAttachCheckFun);
+	hypha_attach_check.SetStability(FunctionStability::VOLATILE);
+	hypha_attach_check.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	loader.RegisterFunction(hypha_attach_check);
 }
 
 void HyphasyncExtension::Load(ExtensionLoader &loader) {

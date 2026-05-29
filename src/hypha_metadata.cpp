@@ -159,8 +159,19 @@ std::string BuildDoctorReport(Connection &con) {
 	report += "hyphasync_version=" + version + "\n";
 	report += "duckdb_version=" + std::string(DuckDB::LibraryVersion()) + "\n";
 	report += std::string("metadata_initialized=") + (initialized ? "true" : "false") + "\n";
-	report += "note=Postgres attach, base snapshot, and sync are not implemented yet";
+	report += "note=base snapshot and sync are not implemented yet; use hypha_attach_check() for Postgres probes";
 	return report;
+}
+
+std::string GetDefaultTargetConnString(Connection &con) {
+	if (!IsHyphaMetadataInitialized(con)) {
+		return "";
+	}
+	auto result = con.Query("SELECT conn_string FROM hypha.target WHERE target_name = 'default'");
+	if (result->HasError() || result->RowCount() == 0) {
+		return "";
+	}
+	return result->GetValue(0, 0).ToString();
 }
 
 } // namespace duckdb
