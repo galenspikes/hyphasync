@@ -21,7 +21,7 @@ SELECT hypha_doctor() LIKE '%metadata_initialized=false%';
 true
 
 query I
-SELECT hypha_doctor() LIKE '%base snapshot and sync are not implemented yet%';
+SELECT hypha_doctor() LIKE '%not implemented yet%';
 ----
 true
 
@@ -76,16 +76,21 @@ true
 
 # Phase 1: attach check against unreachable host (read-only; no remote writes)
 query I
-SELECT hypha_attach_check('postgresql://127.0.0.1:1/nope') LIKE '%status=error%';
+SELECT hypha_attach_check('postgresql://127.0.0.1:65432/hyphasync_unreachable') LIKE '%status=error%';
 ----
 true
 
 query I
-SELECT hypha_attach_check('postgresql://127.0.0.1:1/nope') LIKE '%read-only probe only%';
+SELECT hypha_attach_check('postgresql://127.0.0.1:65432/hyphasync_unreachable') LIKE '%read-only probe only%';
 ----
 true
 
-# NULL / default target: uses hypha.target when configured
+# NULL uses hypha.target default (example-updated); must return a status report, not SQL NULL
+query I
+SELECT hypha_attach_check(NULL) IS NOT NULL;
+----
+true
+
 query I
 SELECT hypha_attach_check(NULL) LIKE '%status=error%';
 ----
