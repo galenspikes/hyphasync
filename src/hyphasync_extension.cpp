@@ -83,5 +83,4 @@ extern "C" {
 DUCKDB_CPP_EXTENSION_ENTRY(hyphasync, loader) {
 	duckdb::LoadInternal(loader);
 }
-
 }
