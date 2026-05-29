@@ -1,0 +1,75 @@
+# name: test/sql/hyphasync.test
+# description: Phase 0 hyphasync extension scaffold tests
+# group: [sql]
+
+statement error
+SELECT hypha_hello();
+----
+Catalog Error: Scalar Function with name hypha_hello does not exist!
+
+require hyphasync
+
+query I
+SELECT hypha_hello();
+----
+hyphasync extension loaded
+
+# Doctor before init reports uninitialized metadata
+query I
+SELECT hypha_doctor() LIKE '%metadata_initialized=false%';
+----
+true
+
+query I
+SELECT hypha_doctor() LIKE '%Postgres attach, base snapshot, and sync are not implemented yet%';
+----
+true
+
+# Initialize local metadata (does not connect to Postgres)
+statement ok
+SELECT hypha_init('postgresql://example');
+
+query I
+SELECT COUNT(*)::BIGINT FROM information_schema.schemata WHERE schema_name = 'hypha';
+----
+1
+
+query I
+SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = 'hypha' AND table_name = 'target';
+----
+1
+
+query I
+SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = 'hypha';
+----
+7
+
+query III
+SELECT target_name, conn_string, last_commit_id FROM hypha.target WHERE target_name = 'default';
+----
+default	postgresql://example	NULL
+
+# Idempotent second init updates connection string only
+statement ok
+SELECT hypha_init('postgresql://example-updated');
+
+query I
+SELECT conn_string FROM hypha.target WHERE target_name = 'default';
+----
+postgresql://example-updated
+
+query I
+SELECT COUNT(*)::BIGINT FROM hypha.target;
+----
+1
+
+# Doctor after init reports initialized metadata
+query I
+SELECT hypha_doctor() LIKE '%metadata_initialized=true%';
+----
+true
+
+query I
+SELECT hypha_doctor() LIKE '%hyphasync_version=%';
+----
+true
