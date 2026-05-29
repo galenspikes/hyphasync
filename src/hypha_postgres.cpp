@@ -115,9 +115,8 @@ std::string RunHyphaAttachCheck(const std::string &conn_string) {
 	}
 
 	if (PQstatus(conn) != CONNECTION_OK) {
-		const auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-		                            std::chrono::steady_clock::now() - started)
-		                            .count();
+		const auto latency_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
 		const auto error = PQEscape(PQerrorMessage(conn));
 		PQfinish(conn);
 		return FormatAttachReport("error", target_name, latency_ms, "", "", "", false, 0, error);
@@ -126,8 +125,8 @@ std::string RunHyphaAttachCheck(const std::string &conn_string) {
 	const auto postgres_version = RunScalarQuery(conn, "SELECT version()");
 	const auto database = RunScalarQuery(conn, "SELECT current_database()");
 	const auto user = RunScalarQuery(conn, "SELECT current_user");
-	const auto remote_hypha_table_count = RunCountQuery(
-	    conn, "SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = 'hypha'");
+	const auto remote_hypha_table_count =
+	    RunCountQuery(conn, "SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = 'hypha'");
 	const bool remote_hypha_schema =
 	    RunCountQuery(conn, "SELECT COUNT(*)::BIGINT FROM information_schema.schemata WHERE schema_name = 'hypha'") > 0;
 
