@@ -20,7 +20,16 @@ cd hyphasync
 make
 ```
 
-On macOS you may need Postgres client libraries, e.g. `brew install libpq` (and export `PKG_CONFIG_PATH` if CMake cannot find libpq). CI uses vcpkg (`libpq` in `vcpkg.json`).
+On macOS (Phase 1+), install and expose libpq before `make`:
+
+```sh
+brew install libpq
+export CMAKE_PREFIX_PATH="$(brew --prefix libpq):${CMAKE_PREFIX_PATH:-}"
+export PKG_CONFIG_PATH="$(brew --prefix libpq)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+make
+```
+
+CI uses vcpkg (`libpq` in `vcpkg.json`). CMake also prepends Homebrew's `opt/libpq` path on Apple builds.
 
 ### Basic usage
 
