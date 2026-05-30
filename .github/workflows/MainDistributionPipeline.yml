@@ -1,5 +1,10 @@
 #
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
+# DuckDB extension-template default: build/test extension binaries across a platform matrix.
+# Hyphasync uses native libpq — not compatible with DuckDB-Wasm; wasm targets are excluded.
+#
+# You do not need the full matrix on every push. For day-to-day PRs, reduced_ci_mode skips
+# redundant architectures (see extension-ci-tools/scripts/modify_distribution_matrix.py).
+# Run the full matrix (minus wasm) on main; use workflow_dispatch for a manual full run.
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -19,6 +24,11 @@ jobs:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5-variegata
       extension_name: hyphasync
+      # libpq is a native Postgres client; DuckDB-Wasm cannot use it.
+      exclude_archs: wasm_mvp;wasm_eh;wasm_threads
+      # PRs and feature-branch pushes: linux_amd64 + osx_arm64 + windows (reduced set).
+      # main: full matrix (still without wasm).
+      reduced_ci_mode: ${{ github.ref == 'refs/heads/main' && 'disabled' || 'enabled' }}
 
   code-quality-check:
     name: Code Quality Check
