@@ -25,73 +25,121 @@ SELECT hypha_doctor() LIKE '%not implemented yet%';
 ----
 true
 
-# Initialize local metadata (does not connect to Postgres)
-statement ok
-SELECT hypha_init('postgresql://example');
+# Doctor reports the local DuckDB identity for sanity-checking the local connection.
+query I
+SELECT hypha_doctor() LIKE '%local_database=%';
+----
+true
 
+query I
+SELECT hypha_doctor() LIKE '%local_database_path=%';
+----
+true
+
+# Doctor reports the metadata schema version and frozen fingerprint algorithm.
+query I
+SELECT hypha_doctor() LIKE '%metadata_schema_version=1%';
+----
+true
+
+query I
+SELECT hypha_doctor() LIKE '%fingerprint_algo=v1%';
+----
+true
+
+# Placeholder capabilities are explicitly labelled as not implemented.
+query I
+SELECT hypha_doctor() LIKE '%capability_base_snapshot_plan=available%';
+----
+true
+
+query I
+SELECT hypha_doctor() LIKE '%capability_base_snapshot=available%';
+----
+true
+
+query I
+SELECT hypha_doctor() LIKE '%capability_sync=available%';
+----
+true
+
+# hypha_base_snapshot_plan() requires initialized metadata; calling it beforehand throws.
+statement error
+SELECT hypha_base_snapshot_plan();
+----
+hypha metadata is not initialized
+
+# hypha_base_snapshot, hypha_sync_plan, hypha_sync are still scaffolded placeholders.
+# hypha_base_snapshot() now requires initialized metadata (no live server in unit tests).
+statement error
+SELECT hypha_base_snapshot();
+----
+hypha metadata is not initialized
+
+# hypha_sync_plan and hypha_sync require initialized metadata (no server in unit tests).
+statement error
+SELECT hypha_sync_plan();
+----
+hypha metadata is not initialized
+
+statement error
+SELECT hypha_sync();
+----
+hypha metadata is not initialized
+
+# hypha_base_snapshot_plan() happy path (catalog walk, snapshot tables populated) is
+# verified by scripts/verify-phase0.sh against a live Postgres + Docker, since
+# hypha_init() now always requires a verified connection before initializing metadata.
+
+# hypha_init now ALWAYS verifies it can reach the Postgres target before
+# storing anything. These cases run without a live server, so they must fail
+# loudly (the happy path is covered by scripts/verify-phase0.sh against Docker).
+
+# NULL connection string is rejected with an actionable message.
+statement error
+SELECT hypha_init(NULL);
+----
+hypha_init requires a Postgres connection string
+
+# Empty connection string is rejected.
+statement error
+SELECT hypha_init('');
+----
+non-empty Postgres connection string
+
+# Unreachable target fails and initializes nothing.
+statement error
+SELECT hypha_init('postgresql://127.0.0.1:65432/hyphasync_unreachable');
+----
+hypha_init could not connect to the Postgres target
+
+# A failed init must not have created the local hypha schema.
 query I
 SELECT COUNT(*)::BIGINT FROM information_schema.schemata WHERE schema_name = 'hypha';
 ----
-1
+0
 
 query I
-SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = 'hypha' AND table_name = 'target';
-----
-1
-
-query I
-SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = 'hypha';
-----
-7
-
-query III
-SELECT target_name, conn_string, last_commit_id FROM hypha.target WHERE target_name = 'default';
-----
-default	postgresql://example	NULL
-
-# Idempotent second init updates connection string only
-statement ok
-SELECT hypha_init('postgresql://example-updated');
-
-query I
-SELECT conn_string FROM hypha.target WHERE target_name = 'default';
-----
-postgresql://example-updated
-
-query I
-SELECT COUNT(*)::BIGINT FROM hypha.target;
-----
-1
-
-# Doctor after init reports initialized metadata
-query I
-SELECT hypha_doctor() LIKE '%metadata_initialized=true%';
+SELECT hypha_doctor() LIKE '%metadata_initialized=false%';
 ----
 true
 
-query I
-SELECT hypha_doctor() LIKE '%hyphasync_version=%';
+# Phase 1: hypha_target_status is a read-only probe. Hard failures (cannot connect)
+# throw loudly so a failed probe can never be mistaken for success in a query.
+statement error
+SELECT hypha_target_status('postgresql://127.0.0.1:65432/hyphasync_unreachable');
 ----
-true
+could not connect to the Postgres target
 
-# Phase 1: attach check against unreachable host (read-only; no remote writes)
-query I
-SELECT hypha_attach_check('postgresql://127.0.0.1:65432/hyphasync_unreachable') LIKE '%status=error%';
+# Malformed connection strings throw with a validation message, not a connect failure.
+statement error
+SELECT hypha_target_status('not a valid conninfo = = =');
 ----
-true
+invalid connection string
 
-query I
-SELECT hypha_attach_check('postgresql://127.0.0.1:65432/hyphasync_unreachable') LIKE '%read-only probe only%';
+# NULL with no initialized target resolves to an empty string: must explain that
+# there is nothing to probe rather than failing silently.
+statement error
+SELECT hypha_target_status(NULL);
 ----
-true
-
-# NULL uses hypha.target default (example-updated); must return a status report, not SQL NULL
-query I
-SELECT hypha_attach_check(NULL) IS NOT NULL;
-----
-true
-
-query I
-SELECT hypha_attach_check(NULL) LIKE '%status=error%';
-----
-true
+no connection string to probe

@@ -7,3 +7,7 @@ testext
 test/python/__pycache__/
 .Rhistory
 .cache/
+# Sample databases for local testing (large binary files; not committed)
+testdata/*.db
+testdata/*.duckdb
+testdata/*.ddb
