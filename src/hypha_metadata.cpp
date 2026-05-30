@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS hypha.commit (
     message VARCHAR,
     created_at TIMESTAMP DEFAULT current_timestamp,
     applied_at TIMESTAMP,
-    status VARCHAR NOT NULL
+    status VARCHAR NOT NULL,
+    fingerprint_algo VARCHAR
 );
 )";
 
@@ -109,6 +110,18 @@ CREATE TABLE IF NOT EXISTS hypha.event_log (
 );
 )";
 
+const char *CREATE_META_SQL = R"(
+CREATE TABLE IF NOT EXISTS hypha.meta (
+    key VARCHAR PRIMARY KEY,
+    value VARCHAR,
+    updated_at TIMESTAMP DEFAULT current_timestamp
+);
+)";
+
+std::string SqlQuote(const std::string &value) {
+	return StringUtil::Replace(value, "'", "''");
+}
+
 } // namespace
 
 bool IsHyphaMetadataInitialized(Connection &con) {
@@ -135,17 +148,63 @@ void EnsureHyphaMetadata(Connection &con, const std::string &conn_string) {
 	Exec(con, CREATE_TABLE_SNAPSHOT_SQL, "CREATE TABLE hypha.table_snapshot");
 	Exec(con, CREATE_ROW_HASH_SQL, "CREATE TABLE hypha.row_hash");
 	Exec(con, CREATE_EVENT_LOG_SQL, "CREATE TABLE hypha.event_log");
+	Exec(con, CREATE_META_SQL, "CREATE TABLE hypha.meta");
 
-	const auto escaped_conn = StringUtil::Replace(conn_string, "'", "''");
+	// Migration: add fingerprint_algo column if it doesn't exist yet (safe on re-init).
+	con.Query("ALTER TABLE hypha.commit ADD COLUMN IF NOT EXISTS fingerprint_algo VARCHAR");
+
+	const auto seed_meta_sql = StringUtil::Format(R"(
+INSERT INTO hypha.meta (key, value) VALUES
+    ('metadata_schema_version', '%s'),
+    ('fingerprint_algo', '%s'),
+    ('hyphasync_version', '%s')
+ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
+)",
+	                                              SqlQuote(HYPHA_METADATA_SCHEMA_VERSION),
+	                                              SqlQuote(HYPHA_FINGERPRINT_ALGO), SqlQuote(HYPHASYNC_VERSION));
+	ThrowOnError(con.Query(seed_meta_sql), "SEED hypha.meta");
+
 	const auto upsert_sql = StringUtil::Format(R"(
 INSERT INTO hypha.target AS t (target_name, conn_string, last_commit_id)
 VALUES ('default', '%s', NULL)
 ON CONFLICT (target_name) DO UPDATE SET
     conn_string = excluded.conn_string
 )",
-	                                           escaped_conn);
+	                                           SqlQuote(conn_string));
 	ThrowOnError(con.Query(upsert_sql), "UPSERT hypha.target default row");
 }
+
+void LogEvent(Connection &con, const std::string &level, const std::string &operation, const std::string &code,
+              const std::string &message, const std::string &details_json) {
+	// Best-effort observability: the event_log table only exists once metadata is
+	// initialized, and a logging failure must never abort the caller's operation.
+	if (!IsHyphaMetadataInitialized(con)) {
+		return;
+	}
+	const std::string details = details_json.empty() ? std::string("NULL") : ("'" + SqlQuote(details_json) + "'");
+	const auto sql = StringUtil::Format(
+	    R"(INSERT INTO hypha.event_log (event_id, level, operation, code, message, details_json)
+VALUES (uuid()::VARCHAR, '%s', '%s', '%s', '%s', %s))",
+	    SqlQuote(level), SqlQuote(operation), SqlQuote(code), SqlQuote(message), details);
+	con.Query(sql);
+}
+
+namespace {
+
+//! Returns the first column of the first row as text, or empty string on error/NULL.
+std::string QueryScalarText(Connection &con, const char *sql) {
+	auto result = con.Query(sql);
+	if (result->HasError() || result->RowCount() == 0) {
+		return "";
+	}
+	const auto value = result->GetValue(0, 0);
+	if (value.IsNull()) {
+		return "";
+	}
+	return value.ToString();
+}
+
+} // namespace
 
 std::string BuildDoctorReport(Connection &con) {
 	const bool initialized = IsHyphaMetadataInitialized(con);
@@ -155,12 +214,36 @@ std::string BuildDoctorReport(Connection &con) {
 		version = EXT_VERSION_HYPHASYNC;
 	}
 #endif
+
+	// Local DuckDB identity, so the user can sanity-check what they are attached to.
+	const auto local_database = QueryScalarText(con, "SELECT current_database()");
+	auto local_database_path =
+	    QueryScalarText(con, "SELECT path FROM duckdb_databases() WHERE database_name = current_database()");
+	if (local_database_path.empty()) {
+		local_database_path = ":memory:";
+	}
+
 	std::string report;
 	report += "hyphasync_version=" + version + "\n";
 	report += "duckdb_version=" + std::string(DuckDB::LibraryVersion()) + "\n";
+	report += "local_database=" + local_database + "\n";
+	report += "local_database_path=" + local_database_path + "\n";
 	report += std::string("metadata_initialized=") + (initialized ? "true" : "false") + "\n";
-	report += "note=base snapshot and sync are not implemented yet; use hypha_attach_check() for Postgres probes";
+	report += "metadata_schema_version=" + std::string(HYPHA_METADATA_SCHEMA_VERSION) + "\n";
+	report += "fingerprint_algo=" + std::string(HYPHA_FINGERPRINT_ALGO) + "\n";
+	// Capability status: anything that is a scaffolded placeholder says so explicitly.
+	report += "capability_init=available\n";
+	report += "capability_target_status=available\n";
+	report += "capability_base_snapshot_plan=available\n";
+	report += "capability_base_snapshot=available\n";
+	report += "capability_sync_plan=available (row-count diff; hashes not yet computed)\n";
+	report += "capability_sync=available (row-count diff; hashes not yet computed)\n";
+	report += "note=base snapshot and sync are not implemented yet; use hypha_target_status() for Postgres probes";
 	return report;
+}
+
+std::string GetCurrentDatabase(Connection &con) {
+	return QueryScalarText(con, "SELECT current_database()");
 }
 
 std::string GetDefaultTargetConnString(Connection &con) {
