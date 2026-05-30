@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 0 local integration check: Postgres is available but must not be mutated.
+# Local integration check: Postgres available; hypha_init + hypha_attach_check are read-only on the remote.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,7 +44,23 @@ FROM information_schema.tables
 WHERE table_schema = 'hypha';
 SQL
 
-echo "==> Verifying PostgreSQL was not mutated by hypha_init"
+echo "==> Running hypha_attach_check (read-only Postgres probe)"
+if ! "$DUCKDB" "$DB_FILE" -noheader -list -c "SELECT hypha_attach_check('${PG_URL}') LIKE '%status=ok%'" | grep -qi true; then
+  echo "hypha_attach_check explicit URL did not report status=ok" >&2
+  "$DUCKDB" "$DB_FILE" -c "SELECT hypha_attach_check('${PG_URL}');"
+  exit 1
+fi
+if ! "$DUCKDB" "$DB_FILE" -noheader -list -c "SELECT hypha_attach_check(NULL) LIKE '%status=ok%'" | grep -qi true; then
+  echo "hypha_attach_check(NULL) did not report status=ok" >&2
+  "$DUCKDB" "$DB_FILE" -c "SELECT hypha_attach_check(NULL);"
+  exit 1
+fi
+if ! "$DUCKDB" "$DB_FILE" -noheader -list -c "SELECT hypha_attach_check(NULL) LIKE '%remote_hypha_schema=false%'" | grep -qi true; then
+  echo "expected no remote hypha schema in Phase 1" >&2
+  exit 1
+fi
+
+echo "==> Verifying PostgreSQL was not mutated by hyphasync"
 docker compose exec -T postgres psql -U hypha -d hypha_test -v ON_ERROR_STOP=1 <<'SQL'
 SELECT COUNT(*)::INT AS marker_rows FROM hypha_phase0_marker;
 SELECT COUNT(*)::INT AS hypha_schema_tables
@@ -52,4 +68,4 @@ FROM information_schema.tables
 WHERE table_schema = 'hypha';
 SQL
 
-echo "==> Phase 0 integration check passed"
+echo "==> Phase 0/1 integration check passed"

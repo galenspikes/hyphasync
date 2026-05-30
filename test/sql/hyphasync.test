@@ -1,5 +1,5 @@
 # name: test/sql/hyphasync.test
-# description: Phase 0 hyphasync extension scaffold tests
+# description: hyphasync extension tests (Phase 0 + Phase 1)
 # group: [sql]
 
 statement error
@@ -21,7 +21,7 @@ SELECT hypha_doctor() LIKE '%metadata_initialized=false%';
 true
 
 query I
-SELECT hypha_doctor() LIKE '%Postgres attach, base snapshot, and sync are not implemented yet%';
+SELECT hypha_doctor() LIKE '%not implemented yet%';
 ----
 true
 
@@ -71,5 +71,27 @@ true
 
 query I
 SELECT hypha_doctor() LIKE '%hyphasync_version=%';
+----
+true
+
+# Phase 1: attach check against unreachable host (read-only; no remote writes)
+query I
+SELECT hypha_attach_check('postgresql://127.0.0.1:65432/hyphasync_unreachable') LIKE '%status=error%';
+----
+true
+
+query I
+SELECT hypha_attach_check('postgresql://127.0.0.1:65432/hyphasync_unreachable') LIKE '%read-only probe only%';
+----
+true
+
+# NULL uses hypha.target default (example-updated); must return a status report, not SQL NULL
+query I
+SELECT hypha_attach_check(NULL) IS NOT NULL;
+----
+true
+
+query I
+SELECT hypha_attach_check(NULL) LIKE '%status=error%';
 ----
 true

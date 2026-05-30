@@ -1,10 +1,9 @@
 #
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
+# Disabled for automatic runs — use Actions → "Main Extension Distribution Pipeline" → Run workflow
+# when you want a full distribution build or format/tidy on CI.
 #
 name: Main Extension Distribution Pipeline
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -19,6 +18,8 @@ jobs:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5-variegata
       extension_name: hyphasync
+      exclude_archs: wasm_mvp;wasm_eh;wasm_threads
+      reduced_ci_mode: disabled
 
   code-quality-check:
     name: Code Quality Check

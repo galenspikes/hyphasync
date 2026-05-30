@@ -16,6 +16,13 @@ This is a C++ DuckDB extension (`hyphasync`). It builds via DuckDB's extension-c
 
 ### Important caveats
 
+- **libpq required (Phase 1+)**: Install Postgres client libraries before building:
+  ```sh
+  brew install libpq
+  export CMAKE_PREFIX_PATH="$(brew --prefix libpq):${CMAKE_PREFIX_PATH:-}"
+  export PKG_CONFIG_PATH="$(brew --prefix libpq)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  ```
+  CMake also checks `/opt/homebrew/opt/libpq` and `/usr/local/opt/libpq` automatically on macOS.
 - **Must use GCC**: The default compiler is Clang 18 which cannot find libstdc++ headers from gcc-13. Always set `CC=gcc CXX=g++` when building.
 - **Submodules required**: The `duckdb/` and `extension-ci-tools/` directories are git submodules. Run `git submodule update --init --recursive` if they are empty.
 - **First build is slow** (~10 minutes): DuckDB itself compiles from source. Subsequent incremental builds are fast.
