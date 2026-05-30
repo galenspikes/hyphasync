@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS hypha.object_snapshot (
     definition_hash VARCHAR,
     content_hash VARCHAR,
     object_fingerprint VARCHAR,
+    pk_columns VARCHAR,
     captured_at TIMESTAMP DEFAULT current_timestamp
 );
 )";
@@ -150,8 +151,9 @@ void EnsureHyphaMetadata(Connection &con, const std::string &conn_string) {
 	Exec(con, CREATE_EVENT_LOG_SQL, "CREATE TABLE hypha.event_log");
 	Exec(con, CREATE_META_SQL, "CREATE TABLE hypha.meta");
 
-	// Migration: add fingerprint_algo column if it doesn't exist yet (safe on re-init).
+	// Migrations: safe to re-run; ADD COLUMN IF NOT EXISTS is idempotent.
 	con.Query("ALTER TABLE hypha.commit ADD COLUMN IF NOT EXISTS fingerprint_algo VARCHAR");
+	con.Query("ALTER TABLE hypha.object_snapshot ADD COLUMN IF NOT EXISTS pk_columns VARCHAR");
 
 	const auto seed_meta_sql = StringUtil::Format(R"(
 INSERT INTO hypha.meta (key, value) VALUES

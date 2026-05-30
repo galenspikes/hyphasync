@@ -293,21 +293,65 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 
 		total_rows += row_count;
 
-		// 5c. Insert object_snapshot with computed hashes (or NULL if unsupported).
+		// 5c. Detect primary key columns for this table.
+		// pk_columns: comma-separated sorted column names, or empty for no PK.
+		// Only single-column PKs are used for row-level diff; composite PKs fall back to TRUNCATE+COPY.
+		const auto pk_result = Exec(con,
+		                            StringUtil::Format(R"(
+SELECT COALESCE(array_to_string(c.constraint_column_names, ','), '') AS pk_columns
+FROM duckdb_tables() t
+LEFT JOIN (
+    SELECT schema_name, table_name, constraint_column_names
+    FROM duckdb_constraints()
+    WHERE database_name = current_database() AND constraint_type = 'PRIMARY KEY'
+) c ON c.schema_name = t.schema_name AND c.table_name = t.table_name
+WHERE t.database_name = current_database()
+  AND t.schema_name = %s AND t.table_name = %s
+LIMIT 1
+)",
+		                                               QuoteLiteral(schema_name), QuoteLiteral(table_name)),
+		                            "detect PK");
+		const std::string pk_columns = (pk_result->RowCount() > 0 && !pk_result->GetValue(0, 0).IsNull())
+		                                   ? pk_result->GetValue(0, 0).ToString()
+		                                   : "";
+
+		// 5d. Insert object_snapshot with computed hashes and pk_columns.
 		const auto def_sql = def_hash_val.empty() ? "NULL" : QuoteLiteral(def_hash_val);
 		const auto th_sql = table_hash_val.empty() ? "NULL" : QuoteLiteral(table_hash_val);
 		const auto fp_sql = obj_fp_val.empty() ? "NULL" : QuoteLiteral(obj_fp_val);
+		const auto pk_sql = pk_columns.empty() ? "NULL" : QuoteLiteral(pk_columns);
 
 		Exec(con,
 		     StringUtil::Format(R"(
 INSERT INTO hypha.object_snapshot
     (commit_id, target_name, schema_name, object_name, object_type,
-     definition_hash, content_hash, object_fingerprint)
-VALUES (%s, %s, %s, %s, 'table', %s, %s, %s)
+     definition_hash, content_hash, object_fingerprint, pk_columns)
+VALUES (%s, %s, %s, %s, 'table', %s, %s, %s, %s)
 )",
 		                        QuoteLiteral(commit_id), QuoteLiteral(target_name), QuoteLiteral(schema_name),
-		                        QuoteLiteral(table_name), def_sql, th_sql, fp_sql),
+		                        QuoteLiteral(table_name), def_sql, th_sql, fp_sql, pk_sql),
 		     "INSERT hypha.object_snapshot");
+
+		// 5e. Populate hypha.row_hash for single-column PK tables.
+		// Composite PKs and no-PK tables fall back to TRUNCATE+COPY in sync.
+		// Row hashes are stored as {pk_json: sha256_hex} for efficient delta computation.
+		if (hashes_ok && !pk_columns.empty() && pk_columns.find(',') == std::string::npos) {
+			const auto pk_col = pk_columns; // single column name
+			// pk_json format: {"col_name":"value"} — values always cast to VARCHAR for type safety.
+			const std::string pk_json_expr =
+			    "'{\"" + pk_col + "\":\"' || CAST(" + QuoteIdent(pk_col) + " AS VARCHAR) || '\"}'";
+			const auto row_hash_expr = RowHashExpr(fp_cols);
+			Exec(con,
+			     StringUtil::Format(R"(
+INSERT INTO hypha.row_hash (commit_id, target_name, schema_name, table_name, pk_json, row_hash)
+SELECT %s, %s, %s, %s, %s, %s
+FROM %s.%s
+)",
+			                        QuoteLiteral(commit_id), QuoteLiteral(target_name), QuoteLiteral(schema_name),
+			                        QuoteLiteral(table_name), pk_json_expr, row_hash_expr, QuoteIdent(schema_name),
+			                        QuoteIdent(table_name)),
+			     "INSERT hypha.row_hash");
+		}
 
 		Exec(con,
 		     StringUtil::Format(R"(
@@ -932,6 +976,194 @@ SELECT ns.sig IS DISTINCT FROM os.sig AS changed FROM ns, os
 	return actions;
 }
 
+// ---------------------------------------------------------------------------
+// ApplyRowLevelDiff(): targeted INSERT/UPDATE/DELETE for a ROWS_CHANGED table.
+// Returns true if row-level diff was applied; false to fall back to TRUNCATE+COPY.
+// Requires: table has a single-column PK and row hashes exist for both commits.
+// ---------------------------------------------------------------------------
+
+struct RowDiff {
+	int64_t inserts = 0;
+	int64_t updates = 0;
+	int64_t deletes = 0;
+};
+
+bool ApplyRowLevelDiff(Connection &con, PGconn *pg, const std::string &schema_name, const std::string &table_name,
+                       const std::string &pg_schema, const std::string &old_commit_id, const std::string &new_commit_id,
+                       const std::string &tmp_dir, RowDiff &diff_out) {
+	// Require a single-column PK recorded in the new snapshot.
+	const auto pk_result =
+	    Exec(con,
+	         StringUtil::Format(R"(
+SELECT COALESCE(pk_columns, '') FROM hypha.object_snapshot
+WHERE commit_id = %s AND schema_name = %s AND object_name = %s LIMIT 1
+)",
+	                            QuoteLiteral(new_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name)),
+	         "get pk_columns");
+	if (pk_result->RowCount() == 0 || pk_result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	const auto pk_columns = pk_result->GetValue(0, 0).ToString();
+	// Only handle single-column PKs; composite PKs fall back to TRUNCATE+COPY.
+	if (pk_columns.empty() || pk_columns.find(',') != std::string::npos) {
+		return false;
+	}
+	const auto pk_col = pk_columns;
+
+	// Require row hashes for both commits (populated during base_snapshot_plan).
+	const auto has_old =
+	    Exec(con,
+	         StringUtil::Format(
+	             "SELECT 1 FROM hypha.row_hash WHERE commit_id=%s AND schema_name=%s AND table_name=%s LIMIT 1",
+	             QuoteLiteral(old_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name)),
+	         "check old hashes");
+	const auto has_new =
+	    Exec(con,
+	         StringUtil::Format(
+	             "SELECT 1 FROM hypha.row_hash WHERE commit_id=%s AND schema_name=%s AND table_name=%s LIMIT 1",
+	             QuoteLiteral(new_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name)),
+	         "check new hashes");
+	if (has_old->RowCount() == 0 || has_new->RowCount() == 0) {
+		return false;
+	}
+
+	// Compute the delta: inserts (new pk not in old), deletes (old pk not in new), updates (hash changed).
+	// pk_json is formatted as {"col":"val"}, so extract via JSON path.
+	// pk_json format: {"col":"val"} — extract value with split_part (no extension needed).
+	const auto delta = con.Query(StringUtil::Format(
+	    R"(
+WITH new_h AS (SELECT pk_json, row_hash FROM hypha.row_hash WHERE commit_id=%s AND schema_name=%s AND table_name=%s),
+     old_h AS (SELECT pk_json, row_hash FROM hypha.row_hash WHERE commit_id=%s AND schema_name=%s AND table_name=%s)
+SELECT 'insert' AS op, split_part(split_part(pk_json, ':"', 2), '"', 1) AS pk_val FROM new_h WHERE pk_json NOT IN (SELECT pk_json FROM old_h)
+UNION ALL
+SELECT 'delete',        split_part(split_part(pk_json, ':"', 2), '"', 1) FROM old_h WHERE pk_json NOT IN (SELECT pk_json FROM new_h)
+UNION ALL
+SELECT 'update',        split_part(split_part(n.pk_json, ':"', 2), '"', 1) FROM new_h n JOIN old_h o USING (pk_json) WHERE n.row_hash != o.row_hash
+)",
+	    QuoteLiteral(new_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name), QuoteLiteral(old_commit_id),
+	    QuoteLiteral(schema_name), QuoteLiteral(table_name)));
+	if (!delta || delta->HasError() || delta->RowCount() == 0) {
+		return true; // No rows to change — treat as success (fingerprint may have detected a no-op)
+	}
+
+	std::vector<std::string> insert_pks, update_pks, delete_pks;
+	for (idx_t i = 0; i < delta->RowCount(); i++) {
+		const auto op = delta->GetValue(0, i).ToString();
+		const auto pv = delta->GetValue(1, i).IsNull() ? "" : delta->GetValue(1, i).ToString();
+		if (op == "insert") {
+			insert_pks.push_back(pv);
+		} else if (op == "update") {
+			update_pks.push_back(pv);
+		} else if (op == "delete") {
+			delete_pks.push_back(pv);
+		}
+	}
+	diff_out.inserts = static_cast<int64_t>(insert_pks.size());
+	diff_out.updates = static_cast<int64_t>(update_pks.size());
+	diff_out.deletes = static_cast<int64_t>(delete_pks.size());
+
+	// Safety: if all extracted pk_vals are empty (e.g., regexp failed or pk_json malformed),
+	// fall back to TRUNCATE+COPY rather than silently applying nothing.
+	auto any_non_empty = [](const std::vector<std::string> &v) {
+		for (const auto &s : v) {
+			if (!s.empty())
+				return true;
+		}
+		return v.empty(); // empty vector means nothing to apply — that's fine
+	};
+	if ((diff_out.inserts > 0 && !any_non_empty(insert_pks)) || (diff_out.updates > 0 && !any_non_empty(update_pks)) ||
+	    (diff_out.deletes > 0 && !any_non_empty(delete_pks))) {
+		return false; // pk extraction failed — caller will TRUNCATE+COPY
+	}
+
+	// DELETE: removed rows + old versions of updated rows.
+	std::vector<std::string> to_delete;
+	to_delete.insert(to_delete.end(), delete_pks.begin(), delete_pks.end());
+	to_delete.insert(to_delete.end(), update_pks.begin(), update_pks.end());
+
+	if (!to_delete.empty()) {
+		std::string arr = "ARRAY[";
+		for (size_t i = 0; i < to_delete.size(); i++) {
+			if (i > 0) {
+				arr += ",";
+			}
+			arr += "'" + StringUtil::Replace(to_delete[i], "'", "''") + "'";
+		}
+		arr += "]";
+		PGExec(pg,
+		       "DELETE FROM " + QuoteIdent(pg_schema) + "." + QuoteIdent(TruncPGIdent(table_name)) + " WHERE CAST(" +
+		           QuoteIdent(pk_col) + " AS TEXT) = ANY(" + arr + ")",
+		       "row-level DELETE");
+	}
+
+	// INSERT: new rows + new versions of updated rows. COPY from DuckDB filtered by PK.
+	std::vector<std::string> to_insert;
+	to_insert.insert(to_insert.end(), insert_pks.begin(), insert_pks.end());
+	to_insert.insert(to_insert.end(), update_pks.begin(), update_pks.end());
+
+	if (!to_insert.empty()) {
+		std::string in_list;
+		for (size_t i = 0; i < to_insert.size(); i++) {
+			if (i > 0) {
+				in_list += ",";
+			}
+			in_list += QuoteLiteral(to_insert[i]);
+		}
+		const auto tmp_file =
+		    tmp_dir + "/" + SanitizeIdent(schema_name) + "_" + SanitizeIdent(table_name) + "_delta.csv";
+		Exec(con,
+		     StringUtil::Format("COPY (SELECT * FROM %s.%s WHERE CAST(%s AS VARCHAR) IN (%s)) TO %s "
+		                        "(FORMAT CSV, HEADER FALSE, NULL '\\N')",
+		                        QuoteIdent(schema_name), QuoteIdent(table_name), QuoteIdent(pk_col), in_list,
+		                        QuoteLiteral(tmp_file)),
+		     "COPY delta to CSV");
+
+		const auto copy_sql =
+		    "COPY " + QuoteIdent(pg_schema) + "." + QuoteIdent(TruncPGIdent(table_name)) + " FROM STDIN CSV NULL '\\N'";
+		PGresult *cr = PQexec(pg, copy_sql.c_str());
+		if (PQresultStatus(cr) != PGRES_COPY_IN) {
+			const auto err = TrimPQ(PQresultErrorMessage(cr));
+			PQclear(cr);
+			remove(tmp_file.c_str());
+			throw IOException("row-level COPY IN failed: " + err);
+		}
+		PQclear(cr);
+		FILE *f = fopen(tmp_file.c_str(), "r");
+		if (!f) {
+			PQputCopyEnd(pg, "open failed");
+			remove(tmp_file.c_str());
+			throw IOException("could not open delta temp file");
+		}
+		char buf[65536];
+		int n;
+		bool ok = true;
+		while ((n = static_cast<int>(fread(buf, 1, sizeof(buf), f))) > 0) {
+			if (PQputCopyData(pg, buf, n) != 1) {
+				ok = false;
+				break;
+			}
+		}
+		fclose(f);
+		remove(tmp_file.c_str());
+		if (!ok) {
+			PQputCopyEnd(pg, "send error");
+			throw IOException("PQputCopyData failed (row-level insert)");
+		}
+		if (PQputCopyEnd(pg, nullptr) != 1) {
+			throw IOException("PQputCopyEnd failed (row-level insert)");
+		}
+		PGresult *done = PQgetResult(pg);
+		if (PQresultStatus(done) != PGRES_COMMAND_OK) {
+			const auto err = TrimPQ(PQresultErrorMessage(done));
+			PQclear(done);
+			throw IOException("row-level COPY failed: " + err);
+		}
+		PQclear(done);
+	}
+
+	return true;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -963,12 +1195,20 @@ LIMIT 1)",
 	const std::string old_fp_algo = base_result->GetValue(1, 0).ToString();
 	const std::string db_name = GetCurrentDatabase(con);
 
-	// Warn if the prior snapshot has no fingerprints; the diff will fall back to row-count only.
+	// Refuse to diff if the old snapshot used a different (real) fingerprint version.
+	// Comparing v1 hashes against v2 hashes would silently produce wrong diffs.
+	if (old_fp_algo != "none" && old_fp_algo != std::string(HYPHA_FINGERPRINT_ALGO)) {
+		throw InvalidInputException("fingerprint_algo mismatch: the last applied snapshot used '%s' but the current "
+		                            "code uses '%s'. Run hypha_base_snapshot() to establish a fresh baseline before "
+		                            "syncing — diffing across fingerprint versions would produce wrong results.",
+		                            old_fp_algo, HYPHA_FINGERPRINT_ALGO);
+	}
+	// Warn (don't block) if the old snapshot has no fingerprints: diff falls back to row-count.
 	if (old_fp_algo == "none") {
 		LogEvent(con, "warn", "sync_plan", "OLD_SNAPSHOT_UNFINGERPRINTED",
 		         "last applied snapshot has no fingerprints (pre-v1); diff falls back to "
 		         "column-signature + row-count only. Run hypha_base_snapshot() for a full "
-		         "fingerprint baseline before relying on hypha_sync() to detect all changes.",
+		         "fingerprint baseline.",
 		         "");
 	}
 
@@ -1052,7 +1292,8 @@ VALUES (%s, %s, 'default', 'sync_plan', 'sync plan: %s tables to sync', 'planned
 	}
 
 	report << "note=fingerprint_algo=" << HYPHA_FINGERPRINT_ALGO << "; table_hash diff detects all changes "
-	       << "including same-count updates/deletes; row-level INSERT/UPDATE/DELETE diff planned for v2";
+	       << "including same-count updates/deletes; row-level diff applies targeted INSERT/UPDATE/DELETE for "
+	          "single-column PK tables";
 	return report.str();
 }
 
@@ -1086,6 +1327,13 @@ LIMIT 1)",
 		throw InvalidInputException("hypha_sync: no Postgres connection string found — call hypha_init() first.");
 	}
 	const std::string db_name = GetCurrentDatabase(con);
+
+	// Refuse to sync across fingerprint versions — wrong diffs would be worse than no sync.
+	if (old_fp_algo != "none" && old_fp_algo != std::string(HYPHA_FINGERPRINT_ALGO)) {
+		throw InvalidInputException("fingerprint_algo mismatch: the last applied snapshot used '%s' but the current "
+		                            "code uses '%s'. Run hypha_base_snapshot() to re-establish a baseline first.",
+		                            old_fp_algo, HYPHA_FINGERPRINT_ALGO);
+	}
 
 	// Fresh catalog walk.
 	RunBaseSnapshotPlan(con);
@@ -1187,11 +1435,22 @@ ORDER BY ordinal_position)",
 							       "SET STORAGE EXTERNAL");
 						}
 					} else {
-						// ROWS_CHANGED: keep schema, just replace data.
+						// ROWS_CHANGED: try row-level diff (INSERT/UPDATE/DELETE) first.
+						// Falls back to TRUNCATE+COPY for tables without a single-column PK
+						// or without row hashes from a prior base_snapshot_plan.
+						RowDiff rd;
+						const bool used_row_level = ApplyRowLevelDiff(con, pg, a.schema_name, a.table_name, pg_schema,
+						                                              old_commit_id, new_commit_id, tmp_dir, rd);
+						if (used_row_level) {
+							tables_synced++;
+							rows_synced += rd.inserts + rd.updates;
+							continue; // Skip the COPY block below — already applied
+						}
+						// Fall back to TRUNCATE+COPY.
 						PGExec(pg, "TRUNCATE TABLE " + QuoteIdent(pg_schema) + "." + QuoteIdent(pg_table), "TRUNCATE");
 					}
 
-					// COPY data.
+					// COPY data (full table — used for NEW, SCHEMA_CHANGED, and ROWS_CHANGED fallback).
 					const std::string tmp_file =
 					    tmp_dir + "/" + SanitizeIdent(a.schema_name) + "_" + SanitizeIdent(a.table_name) + ".csv";
 					Exec(con,
@@ -1315,7 +1574,7 @@ VALUES (%s, %s, 'default', 'sync',
 	report << "tables_skipped=" << tables_skipped << "\n";
 	report << "rows_synced=" << rows_synced << "\n";
 	report << "note=fingerprint_algo=" << HYPHA_FINGERPRINT_ALGO << "; table_hash diff detects all changes; "
-	       << "row-level INSERT/UPDATE/DELETE diff planned for v2";
+	       << "row-level diff: single-column PK tables use targeted INSERT/UPDATE/DELETE; others use TRUNCATE+COPY";
 	return report.str();
 }
 
