@@ -945,9 +945,13 @@ std::string RunSyncPlan(Connection &con) {
 
 	// Require a prior applied snapshot to diff against.
 	const auto base_result = Exec(con, R"(
-SELECT commit_id, COALESCE(fingerprint_algo, 'none') AS old_algo FROM hypha.commit
-WHERE status = 'applied'
-ORDER BY applied_at DESC NULLS LAST, created_at DESC
+SELECT
+    COALESCE(c.parent_commit_id, c.commit_id) AS commit_id,
+    COALESCE(p.fingerprint_algo, c.fingerprint_algo, 'none') AS old_algo
+FROM hypha.commit c
+LEFT JOIN hypha.commit p ON p.commit_id = c.parent_commit_id
+WHERE c.status = 'applied'
+ORDER BY c.applied_at DESC NULLS LAST, c.created_at DESC
 LIMIT 1)",
 	                              "get last applied commit");
 	if (base_result->RowCount() == 0) {
@@ -1063,9 +1067,13 @@ std::string RunSync(Connection &con) {
 
 	// Require a prior applied snapshot.
 	const auto base_result = Exec(con, R"(
-SELECT commit_id, COALESCE(fingerprint_algo, 'none') AS old_algo FROM hypha.commit
-WHERE status = 'applied'
-ORDER BY applied_at DESC NULLS LAST, created_at DESC
+SELECT
+    COALESCE(c.parent_commit_id, c.commit_id) AS commit_id,
+    COALESCE(p.fingerprint_algo, c.fingerprint_algo, 'none') AS old_algo
+FROM hypha.commit c
+LEFT JOIN hypha.commit p ON p.commit_id = c.parent_commit_id
+WHERE c.status = 'applied'
+ORDER BY c.applied_at DESC NULLS LAST, c.created_at DESC
 LIMIT 1)",
 	                              "get last applied commit");
 	if (base_result->RowCount() == 0) {
@@ -1278,14 +1286,14 @@ ORDER BY ordinal_position)",
 	const std::string sync_commit_id = sync_id_result->GetValue(0, 0).ToString();
 	Exec(con,
 	     StringUtil::Format(R"(
-INSERT INTO hypha.commit (commit_id, parent_commit_id, target_name, kind, message, applied_at, status)
+INSERT INTO hypha.commit (commit_id, parent_commit_id, target_name, kind, message, applied_at, status, fingerprint_algo)
 VALUES (%s, %s, 'default', 'sync',
         'sync: %s table(s) synced, %s dropped, %s skipped',
-        now(), 'applied')
+        now(), 'applied', %s)
 )",
 	                        QuoteLiteral(sync_commit_id), QuoteLiteral(new_commit_id),
 	                        std::to_string(tables_synced).c_str(), std::to_string(tables_dropped).c_str(),
-	                        std::to_string(tables_skipped).c_str()),
+	                        std::to_string(tables_skipped).c_str(), QuoteLiteral(HYPHA_FINGERPRINT_ALGO)),
 	     "INSERT sync commit");
 
 	const std::string details = "{\"commit_id\":\"" + sync_commit_id +

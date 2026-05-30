@@ -236,9 +236,10 @@ std::string BuildDoctorReport(Connection &con) {
 	report += "capability_target_status=available\n";
 	report += "capability_base_snapshot_plan=available\n";
 	report += "capability_base_snapshot=available\n";
-	report += "capability_sync_plan=available (row-count diff; hashes not yet computed)\n";
-	report += "capability_sync=available (row-count diff; hashes not yet computed)\n";
-	report += "note=base snapshot and sync are not implemented yet; use hypha_target_status() for Postgres probes";
+	report += "capability_sync_plan=available (SHA-256 fingerprint diff; detects all changes)\n";
+	report += "capability_sync=available (SHA-256 fingerprint diff; row-level diff planned for v2)\n";
+	report += "note=use hypha_target_status() to probe the Postgres target; hypha_base_snapshot() to push; "
+	          "hypha_sync() to sync";
 	return report;
 }
 

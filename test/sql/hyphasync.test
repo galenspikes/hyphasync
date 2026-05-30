@@ -21,7 +21,7 @@ SELECT hypha_doctor() LIKE '%metadata_initialized=false%';
 true
 
 query I
-SELECT hypha_doctor() LIKE '%not implemented yet%';
+SELECT hypha_doctor() LIKE '%hypha_target_status()%';
 ----
 true
 
