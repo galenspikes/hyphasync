@@ -332,14 +332,29 @@ VALUES (%s, %s, %s, %s, 'table', %s, %s, %s, %s)
 		                        QuoteLiteral(table_name), def_sql, th_sql, fp_sql, pk_sql),
 		     "INSERT hypha.object_snapshot");
 
-		// 5e. Populate hypha.row_hash for single-column PK tables.
-		// Composite PKs and no-PK tables fall back to TRUNCATE+COPY in sync.
-		// Row hashes are stored as {pk_json: sha256_hex} for efficient delta computation.
-		if (hashes_ok && !pk_columns.empty() && pk_columns.find(',') == std::string::npos) {
-			const auto pk_col = pk_columns; // single column name
-			// pk_json format: {"col_name":"value"} — values always cast to VARCHAR for type safety.
-			const std::string pk_json_expr =
-			    "'{\"" + pk_col + "\":\"' || CAST(" + QuoteIdent(pk_col) + " AS VARCHAR) || '\"}'";
+		// 5e. Populate hypha.row_hash for tables with any PK (single or composite).
+		// No-PK tables fall back to TRUNCATE+COPY in sync.
+		// pk_json: chr(31)-separated PK values in sorted column order (e.g. "42" or "1\x1falice").
+		// This is a compact compound key — not JSON — so no parsing extension is needed.
+		if (hashes_ok && !pk_columns.empty()) {
+			// Parse and sort PK column names for determinism.
+			std::vector<std::string> pk_col_vec;
+			{
+				std::string rem = pk_columns;
+				while (!rem.empty()) {
+					const auto c = rem.find(',');
+					pk_col_vec.push_back(c == std::string::npos ? rem : rem.substr(0, c));
+					rem = c == std::string::npos ? "" : rem.substr(c + 1);
+				}
+			}
+			std::sort(pk_col_vec.begin(), pk_col_vec.end());
+
+			// Build SQL expression: col1_cast || chr(31) || col2_cast || ...
+			std::string pk_json_expr = "CAST(" + QuoteIdent(pk_col_vec[0]) + " AS VARCHAR)";
+			for (size_t pki = 1; pki < pk_col_vec.size(); pki++) {
+				pk_json_expr += " || chr(31) || CAST(" + QuoteIdent(pk_col_vec[pki]) + " AS VARCHAR)";
+			}
+
 			const auto row_hash_expr = RowHashExpr(fp_cols);
 			Exec(con,
 			     StringUtil::Format(R"(
@@ -977,10 +992,66 @@ SELECT ns.sig IS DISTINCT FROM os.sig AS changed FROM ns, os
 }
 
 // ---------------------------------------------------------------------------
-// ApplyRowLevelDiff(): targeted INSERT/UPDATE/DELETE for a ROWS_CHANGED table.
-// Returns true if row-level diff was applied; false to fall back to TRUNCATE+COPY.
-// Requires: table has a single-column PK and row hashes exist for both commits.
+// ApplyRowLevelDiff(): targeted INSERT/UPDATE/DELETE for ROWS_CHANGED tables.
+// Works for any PK (single-column or composite). Falls back to TRUNCATE+COPY
+// for no-PK tables or tables without row hashes from a prior snapshot.
 // ---------------------------------------------------------------------------
+
+//! Split a chr(31)-separated compound pk_json key into individual column values.
+std::vector<std::string> SplitPkKey(const std::string &pk_json) {
+	std::vector<std::string> parts;
+	std::string cur;
+	for (char c : pk_json) {
+		if (c == '\x1f') {
+			parts.push_back(cur);
+			cur.clear();
+		} else {
+			cur += c;
+		}
+	}
+	parts.push_back(cur);
+	return parts;
+}
+
+//! Build a WHERE filter expression for a set of pk_json compound keys.
+//! For single-column PKs: col IN ('v1','v2')
+//! For composite PKs:     (col1 = 'v1a' AND col2 = 'v1b') OR (col1 = 'v2a' AND col2 = 'v2b')
+//! cast_type: "TEXT" for Postgres, "VARCHAR" for DuckDB.
+std::string BuildPkFilter(const std::vector<std::string> &pk_cols, const std::vector<std::string> &pk_vals,
+                          const std::string &cast_type) {
+	if (pk_vals.empty()) {
+		return "FALSE";
+	}
+	if (pk_cols.size() == 1) {
+		// Single PK: compact IN clause.
+		std::string list;
+		for (const auto &v : pk_vals) {
+			if (!list.empty())
+				list += ",";
+			list += "'" + StringUtil::Replace(v, "'", "''") + "'";
+		}
+		return "CAST(" + QuoteIdent(pk_cols[0]) + " AS " + cast_type + ") IN (" + list + ")";
+	}
+	// Composite PK: OR of AND conditions.
+	std::string conds;
+	for (const auto &pk_val : pk_vals) {
+		const auto parts = SplitPkKey(pk_val);
+		if (parts.size() != pk_cols.size()) {
+			continue; // malformed — skip; safety net handles this
+		}
+		if (!conds.empty())
+			conds += " OR ";
+		conds += "(";
+		for (size_t i = 0; i < pk_cols.size(); i++) {
+			if (i > 0)
+				conds += " AND ";
+			conds += "CAST(" + QuoteIdent(pk_cols[i]) + " AS " + cast_type + ") = '" +
+			         StringUtil::Replace(parts[i], "'", "''") + "'";
+		}
+		conds += ")";
+	}
+	return conds.empty() ? "FALSE" : conds;
+}
 
 struct RowDiff {
 	int64_t inserts = 0;
@@ -991,7 +1062,7 @@ struct RowDiff {
 bool ApplyRowLevelDiff(Connection &con, PGconn *pg, const std::string &schema_name, const std::string &table_name,
                        const std::string &pg_schema, const std::string &old_commit_id, const std::string &new_commit_id,
                        const std::string &tmp_dir, RowDiff &diff_out) {
-	// Require a single-column PK recorded in the new snapshot.
+	// Get PK columns from the new snapshot's object_snapshot.
 	const auto pk_result =
 	    Exec(con,
 	         StringUtil::Format(R"(
@@ -1004,13 +1075,23 @@ WHERE commit_id = %s AND schema_name = %s AND object_name = %s LIMIT 1
 		return false;
 	}
 	const auto pk_columns = pk_result->GetValue(0, 0).ToString();
-	// Only handle single-column PKs; composite PKs fall back to TRUNCATE+COPY.
-	if (pk_columns.empty() || pk_columns.find(',') != std::string::npos) {
-		return false;
+	if (pk_columns.empty()) {
+		return false; // No PK — fall back to TRUNCATE+COPY
 	}
-	const auto pk_col = pk_columns;
 
-	// Require row hashes for both commits (populated during base_snapshot_plan).
+	// Parse and sort PK column names (must match the order used when building pk_json).
+	std::vector<std::string> pk_cols;
+	{
+		std::string rem = pk_columns;
+		while (!rem.empty()) {
+			const auto c = rem.find(',');
+			pk_cols.push_back(c == std::string::npos ? rem : rem.substr(0, c));
+			rem = c == std::string::npos ? "" : rem.substr(c + 1);
+		}
+	}
+	std::sort(pk_cols.begin(), pk_cols.end());
+
+	// Require row hashes for both commits.
 	const auto has_old =
 	    Exec(con,
 	         StringUtil::Format(
@@ -1027,72 +1108,60 @@ WHERE commit_id = %s AND schema_name = %s AND object_name = %s LIMIT 1
 		return false;
 	}
 
-	// Compute the delta: inserts (new pk not in old), deletes (old pk not in new), updates (hash changed).
-	// pk_json is formatted as {"col":"val"}, so extract via JSON path.
-	// pk_json format: {"col":"val"} — extract value with split_part (no extension needed).
-	const auto delta = con.Query(StringUtil::Format(
-	    R"(
+	// Compute the delta. pk_json IS the compound key — no extraction needed.
+	// (Format: "val1" for single PK, "val1\x1fval2" for composite.)
+	const auto delta =
+	    con.Query(StringUtil::Format(R"(
 WITH new_h AS (SELECT pk_json, row_hash FROM hypha.row_hash WHERE commit_id=%s AND schema_name=%s AND table_name=%s),
      old_h AS (SELECT pk_json, row_hash FROM hypha.row_hash WHERE commit_id=%s AND schema_name=%s AND table_name=%s)
-SELECT 'insert' AS op, split_part(split_part(pk_json, ':"', 2), '"', 1) AS pk_val FROM new_h WHERE pk_json NOT IN (SELECT pk_json FROM old_h)
+SELECT 'insert' AS op, pk_json AS pk_val FROM new_h WHERE pk_json NOT IN (SELECT pk_json FROM old_h)
 UNION ALL
-SELECT 'delete',        split_part(split_part(pk_json, ':"', 2), '"', 1) FROM old_h WHERE pk_json NOT IN (SELECT pk_json FROM new_h)
+SELECT 'delete',        pk_json          FROM old_h WHERE pk_json NOT IN (SELECT pk_json FROM new_h)
 UNION ALL
-SELECT 'update',        split_part(split_part(n.pk_json, ':"', 2), '"', 1) FROM new_h n JOIN old_h o USING (pk_json) WHERE n.row_hash != o.row_hash
+SELECT 'update',        n.pk_json        FROM new_h n JOIN old_h o USING (pk_json) WHERE n.row_hash != o.row_hash
 )",
-	    QuoteLiteral(new_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name), QuoteLiteral(old_commit_id),
-	    QuoteLiteral(schema_name), QuoteLiteral(table_name)));
+	                                 QuoteLiteral(new_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name),
+	                                 QuoteLiteral(old_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name)));
 	if (!delta || delta->HasError() || delta->RowCount() == 0) {
-		return true; // No rows to change — treat as success (fingerprint may have detected a no-op)
+		return true; // No rows changed — treat as success
 	}
 
 	std::vector<std::string> insert_pks, update_pks, delete_pks;
 	for (idx_t i = 0; i < delta->RowCount(); i++) {
 		const auto op = delta->GetValue(0, i).ToString();
 		const auto pv = delta->GetValue(1, i).IsNull() ? "" : delta->GetValue(1, i).ToString();
-		if (op == "insert") {
+		if (op == "insert")
 			insert_pks.push_back(pv);
-		} else if (op == "update") {
+		else if (op == "update")
 			update_pks.push_back(pv);
-		} else if (op == "delete") {
+		else if (op == "delete")
 			delete_pks.push_back(pv);
-		}
 	}
 	diff_out.inserts = static_cast<int64_t>(insert_pks.size());
 	diff_out.updates = static_cast<int64_t>(update_pks.size());
 	diff_out.deletes = static_cast<int64_t>(delete_pks.size());
 
-	// Safety: if all extracted pk_vals are empty (e.g., regexp failed or pk_json malformed),
-	// fall back to TRUNCATE+COPY rather than silently applying nothing.
+	// Safety: if all pk_vals are empty the compound key is malformed — fall back.
 	auto any_non_empty = [](const std::vector<std::string> &v) {
 		for (const auto &s : v) {
 			if (!s.empty())
 				return true;
 		}
-		return v.empty(); // empty vector means nothing to apply — that's fine
+		return v.empty();
 	};
 	if ((diff_out.inserts > 0 && !any_non_empty(insert_pks)) || (diff_out.updates > 0 && !any_non_empty(update_pks)) ||
 	    (diff_out.deletes > 0 && !any_non_empty(delete_pks))) {
-		return false; // pk extraction failed — caller will TRUNCATE+COPY
+		return false;
 	}
 
 	// DELETE: removed rows + old versions of updated rows.
 	std::vector<std::string> to_delete;
 	to_delete.insert(to_delete.end(), delete_pks.begin(), delete_pks.end());
 	to_delete.insert(to_delete.end(), update_pks.begin(), update_pks.end());
-
 	if (!to_delete.empty()) {
-		std::string arr = "ARRAY[";
-		for (size_t i = 0; i < to_delete.size(); i++) {
-			if (i > 0) {
-				arr += ",";
-			}
-			arr += "'" + StringUtil::Replace(to_delete[i], "'", "''") + "'";
-		}
-		arr += "]";
 		PGExec(pg,
-		       "DELETE FROM " + QuoteIdent(pg_schema) + "." + QuoteIdent(TruncPGIdent(table_name)) + " WHERE CAST(" +
-		           QuoteIdent(pk_col) + " AS TEXT) = ANY(" + arr + ")",
+		       "DELETE FROM " + QuoteIdent(pg_schema) + "." + QuoteIdent(TruncPGIdent(table_name)) + " WHERE " +
+		           BuildPkFilter(pk_cols, to_delete, "TEXT"),
 		       "row-level DELETE");
 	}
 
@@ -1100,22 +1169,13 @@ SELECT 'update',        split_part(split_part(n.pk_json, ':"', 2), '"', 1) FROM 
 	std::vector<std::string> to_insert;
 	to_insert.insert(to_insert.end(), insert_pks.begin(), insert_pks.end());
 	to_insert.insert(to_insert.end(), update_pks.begin(), update_pks.end());
-
 	if (!to_insert.empty()) {
-		std::string in_list;
-		for (size_t i = 0; i < to_insert.size(); i++) {
-			if (i > 0) {
-				in_list += ",";
-			}
-			in_list += QuoteLiteral(to_insert[i]);
-		}
+		const auto filter = BuildPkFilter(pk_cols, to_insert, "VARCHAR");
 		const auto tmp_file =
 		    tmp_dir + "/" + SanitizeIdent(schema_name) + "_" + SanitizeIdent(table_name) + "_delta.csv";
 		Exec(con,
-		     StringUtil::Format("COPY (SELECT * FROM %s.%s WHERE CAST(%s AS VARCHAR) IN (%s)) TO %s "
-		                        "(FORMAT CSV, HEADER FALSE, NULL '\\N')",
-		                        QuoteIdent(schema_name), QuoteIdent(table_name), QuoteIdent(pk_col), in_list,
-		                        QuoteLiteral(tmp_file)),
+		     StringUtil::Format("COPY (SELECT * FROM %s.%s WHERE %s) TO %s (FORMAT CSV, HEADER FALSE, NULL '\\N')",
+		                        QuoteIdent(schema_name), QuoteIdent(table_name), filter, QuoteLiteral(tmp_file)),
 		     "COPY delta to CSV");
 
 		const auto copy_sql =
@@ -1147,10 +1207,10 @@ SELECT 'update',        split_part(split_part(n.pk_json, ':"', 2), '"', 1) FROM 
 		remove(tmp_file.c_str());
 		if (!ok) {
 			PQputCopyEnd(pg, "send error");
-			throw IOException("PQputCopyData failed (row-level insert)");
+			throw IOException("PQputCopyData failed");
 		}
 		if (PQputCopyEnd(pg, nullptr) != 1) {
-			throw IOException("PQputCopyEnd failed (row-level insert)");
+			throw IOException("PQputCopyEnd failed");
 		}
 		PGresult *done = PQgetResult(pg);
 		if (PQresultStatus(done) != PGRES_COMMAND_OK) {
