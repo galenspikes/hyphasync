@@ -32,12 +32,22 @@
 - Graceful fallback to column-signature + row-count for pre-fingerprint snapshots
 - Version-mismatch warning when syncing against an unfingerprinted prior snapshot
 
-## Next (v2)
+### Phase 5 — Row-level diff (single + composite PKs)
+- `hypha.row_hash` populated with SHA-256 per-row hashes keyed by compound PK key
+- PK detection from `duckdb_constraints()` — single-column and composite PKs both supported
+- `ApplyRowLevelDiff()`: targeted DELETE + INSERT for changed rows; TRUNCATE+COPY fallback for no-PK tables
+- Fingerprint version enforcement: refuses to diff across algo versions
+- pk_json format: chr(31)-separated compound key (no JSON extension required)
 
-### Row-level diff
-- Populate `hypha.row_hash` with per-row hashes keyed by `pk_json`
-- Generate surgical `INSERT / UPDATE / DELETE` statements instead of TRUNCATE+COPY
-- Requires PK detection and keyless-table policy (full-row identity, documented in fingerprinting spec)
+## Next
+
+### Remote `hypha` metadata
+- Create a `hypha` schema on the Postgres target recording what was pushed and when
+- Enables audit from Postgres, resumable syncs, multi-source scenarios
+
+### Nested type support (LIST/STRUCT/MAP)
+- Fingerprinting: canonical encoding for LIST (in-order), STRUCT (field order), MAP (sorted keys)
+- Type mapping: LIST → Postgres array, STRUCT/MAP → JSONB
 
 ### Remote `hypha` metadata
 - Mirror sync state on the Postgres target (extension-owned `hypha` schema on the remote side)

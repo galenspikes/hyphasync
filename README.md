@@ -16,8 +16,12 @@ All six workflow functions are implemented. The sync is correct: fingerprinting 
 | SHA-256 fingerprinting (table_hash, definition_hash) | ✅ |
 | Base snapshot: DuckDB → Postgres COPY | ✅ |
 | Incremental sync with fingerprint diff | ✅ |
-| Row-level INSERT/UPDATE/DELETE (vs TRUNCATE+COPY) | planned v2 |
-| Remote `hypha` metadata on Postgres | planned v2 |
+| Row-level diff: single-column PKs | ✅ |
+| Row-level diff: composite PKs | ✅ |
+| No-PK tables | ✅ TRUNCATE+COPY fallback |
+| Remote `hypha` metadata on Postgres | planned |
+| Nested type fingerprinting (LIST/STRUCT/MAP) | planned |
+| Targeted schema evolution DDL | planned |
 | CDC / WAL / streaming replication | non-goal |
 
 ## Quick start
@@ -144,7 +148,17 @@ Postgres schemas are named `<duckdb_filename>_<duckdb_schema>`:
 | `mydb.duckdb` / `main` | `mydb_main` |
 | `analytics.duckdb` / `reports` | `analytics_reports` |
 
-Column types are mapped from DuckDB to Postgres (e.g. `DECIMAL(10,2)` → `numeric(10,2)`, `TIMESTAMPTZ` → `timestamp with time zone`). Unsupported types (nested LIST/STRUCT/MAP) are skipped with a `warn` entry in `hypha.event_log`.
+Column types are mapped from DuckDB to Postgres (e.g. `DECIMAL(10,2)` → `numeric(10,2)`, `TIMESTAMPTZ` → `timestamp with time zone`). Unsupported nested types (LIST/STRUCT/MAP) are skipped with a `warn` entry in `hypha.event_log` — planned for a future release.
+
+## Sync behaviour by PK type
+
+| Table PK | Sync method |
+|----------|-------------|
+| Single-column PK | Targeted DELETE + INSERT for changed rows only |
+| Composite PK | Same — compound key used for row identity |
+| No PK | TRUNCATE + COPY (correct, not as efficient) |
+
+The sync first computes `table_hash` (SHA-256 of all row hashes) to detect whether any data changed. If the hash matches the prior snapshot, the table is skipped entirely — zero Postgres work regardless of row count. Only changed tables trigger any row-level operations.
 
 ## SQL surface
 
