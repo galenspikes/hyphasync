@@ -1,5 +1,7 @@
 #include "hypha_fingerprint.hpp"
 
+#include "hypha_postgres.hpp"
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
@@ -113,16 +115,17 @@ std::string FieldEncodingExpr(const std::string &col_expr, const std::string &du
 	}
 
 	// VARCHAR / TEXT: tag 's', raw UTF-8 bytes.
-	// NFC normalization deferred to v2 (see docs/fingerprinting.md §4.2).
-	// Byte count: octet_length(CAST(x AS BLOB)) — DuckDB's octet_length() accepts BLOB
-	// but not VARCHAR directly; casting to BLOB gives the UTF-8 byte representation.
+	// NFC normalization deferred to a future version.
+	// Byte count: strlen(col) returns the UTF-8 byte length for VARCHAR strings, correctly
+	// handling multi-byte characters (e.g. em dash = 3 bytes). We avoid CAST(col AS BLOB)
+	// which DuckDB rejects for strings containing non-ASCII bytes.
 	if (t == "VARCHAR" || t == "TEXT" || t == "STRING" || t == "CHAR VARYING" || t == "CHARACTER VARYING" ||
 	    StringUtil::StartsWith(t, "VARCHAR(") || StringUtil::StartsWith(t, "CHAR(") ||
 	    StringUtil::StartsWith(t, "CHARACTER(")) {
 		return "CASE WHEN (" + col_expr +
 		       ") IS NULL THEN 'n():'"
-		       " ELSE 's(' || octet_length(CAST((" +
-		       col_expr + ") AS BLOB)) || '):' || (" + col_expr + ") END";
+		       " ELSE 's(' || strlen((" +
+		       col_expr + ")) || '):' || (" + col_expr + ") END";
 	}
 
 	// BLOB / BYTEA: tag 'x', lowercase hex.
@@ -156,7 +159,10 @@ std::string FieldEncodingExpr(const std::string &col_expr, const std::string &du
 	}
 
 	// TIMESTAMP (no tz): tag 't', YYYY-MM-DDThh:mm:ss.ffffff.
-	if (t == "TIMESTAMP" || t == "DATETIME" || t == "TIMESTAMP WITHOUT TIME ZONE") {
+	// TIMESTAMP_S/MS/NS: DuckDB sub-second-precision variants — epoch_us() works on all of them;
+	// sub-second parts are zero for TIMESTAMP_S, microsecond-aligned for TIMESTAMP_MS.
+	if (t == "TIMESTAMP" || t == "DATETIME" || t == "TIMESTAMP WITHOUT TIME ZONE" || t == "TIMESTAMP_S" ||
+	    t == "TIMESTAMP_MS" || t == "TIMESTAMP_NS") {
 		const auto e = col_expr;
 		const auto us_frac = "(epoch_us((" + e + ")) % 1000000)";
 		const auto payload =
@@ -210,10 +216,45 @@ std::string FieldEncodingExpr(const std::string &col_expr, const std::string &du
 		return nullable("B", "CAST((" + col_expr + ") AS VARCHAR)");
 	}
 
-	// Nested / unsupported: throw rather than silently skip (spec §9, §4.3).
+	// ---------------------------------------------------------------------------
+	// v2: Nested types — LIST, STRUCT/ROW, MAP (spec §4.2 tags L, R, M).
+	// Payload: DuckDB's ::JSON::VARCHAR canonical serialization, which is
+	// deterministic within a DuckDB version and satisfies the same-engine
+	// comparison guarantee (spec §2).  A future v3 may implement the full
+	// recursive sub-field encoding from the spec.
+	// ---------------------------------------------------------------------------
+
+	// LIST / ARRAY: tag 'L', payload = JSON array string.
+	if (StringUtil::EndsWith(t, "[]") || StringUtil::StartsWith(t, "LIST(")) {
+		const auto jp = "CAST((" + col_expr + ")::JSON AS VARCHAR)";
+		return "CASE WHEN (" + col_expr +
+		       ") IS NULL THEN 'n():'"
+		       " ELSE 'L(' || octet_length(CAST((" +
+		       jp + ") AS BLOB)) || '):' || (" + jp + ") END";
+	}
+
+	// STRUCT / ROW: tag 'R', payload = JSON object string.
+	if (StringUtil::StartsWith(t, "STRUCT(") || StringUtil::StartsWith(t, "ROW(")) {
+		const auto jp = "CAST((" + col_expr + ")::JSON AS VARCHAR)";
+		return "CASE WHEN (" + col_expr +
+		       ") IS NULL THEN 'n():'"
+		       " ELSE 'R(' || octet_length(CAST((" +
+		       jp + ") AS BLOB)) || '):' || (" + jp + ") END";
+	}
+
+	// MAP: tag 'M', payload = JSON object string (DuckDB sorts map keys in JSON output).
+	if (StringUtil::StartsWith(t, "MAP(")) {
+		const auto jp = "CAST((" + col_expr + ")::JSON AS VARCHAR)";
+		return "CASE WHEN (" + col_expr +
+		       ") IS NULL THEN 'n():'"
+		       " ELSE 'M(' || octet_length(CAST((" +
+		       jp + ") AS BLOB)) || '):' || (" + jp + ") END";
+	}
+
+	// Unsupported: throw rather than silently skip (spec §9).
 	throw NotImplementedException(
-	    "fingerprinting of DuckDB type '%s' is not yet supported in v1 (column expression: %s). "
-	    "Nested types (LIST, STRUCT, MAP) are reserved for v2. See docs/fingerprinting.md §4.3.",
+	    "fingerprinting of DuckDB type '%s' is not yet supported in v2 (column expression: %s). "
+	    "See docs/fingerprinting.md for supported types.",
 	    duckdb_type, col_expr);
 }
 
@@ -241,37 +282,224 @@ std::string RowHashExpr(const std::vector<std::pair<std::string, std::string>> &
 }
 
 // ---------------------------------------------------------------------------
-// ComputeTableFingerprint(): full table scan → table_hash + row_count
+// v3 pluggable fingerprint strategy engine
+//
+//   EXACT           estimated table bytes < 1 MB → full per-row sha256 (exact, cheap for small tables)
+//   APPEND_ONLY     integer PK / monotonic timestamp → COUNT + MAX(signal_col) (O(1))
+//   MUTABLE_ENTITY  everything else → COUNT + MIN/MAX(rowid) via zone maps (O(1))
+//
+// See docs/fingerprinting.md §6.4 for the full specification and trade-offs.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// ---- Type classification helpers ----
+
+bool IsIntegerType(const std::string &t) {
+	const auto u = StringUtil::Upper(t);
+	return u == "BIGINT" || u == "INT8" || u == "LONG" || u == "INTEGER" || u == "INT4" || u == "INT" ||
+	       u == "SIGNED" || u == "SMALLINT" || u == "INT2" || u == "SHORT" || u == "TINYINT" || u == "INT1" ||
+	       u == "UBIGINT" || u == "UINTEGER" || u == "USMALLINT" || u == "UTINYINT" || u == "HUGEINT";
+}
+
+bool IsTimestampType(const std::string &t) {
+	const auto u = StringUtil::Upper(t);
+	return u == "TIMESTAMP" || u == "DATETIME" || u == "TIMESTAMPTZ" || u == "TIMESTAMP WITH TIME ZONE" ||
+	       u == "TIMESTAMP WITHOUT TIME ZONE" || u == "TIMESTAMP_S" || u == "TIMESTAMP_MS" || u == "TIMESTAMP_NS";
+}
+
+// Estimate average CSV bytes per row from the (name, duckdb_type) column list.
+// Mirrors EstimateCSVBytesPerRow() in hypha_snapshot.cpp but operates on the
+// classifier's column-pair type instead of ColumnDef.
+int64_t EstimateBytesPerRow(const std::vector<std::pair<std::string, std::string>> &cols) {
+	int64_t bytes = 0;
+	for (const auto &col : cols) {
+		const auto t = StringUtil::Upper(col.second);
+		int64_t w;
+		if (t == "INTEGER" || t == "INT4" || t == "INT" || t == "SIGNED") {
+			w = 11;
+		} else if (t == "BIGINT" || t == "INT8" || t == "LONG" || t == "HUGEINT") {
+			w = 20;
+		} else if (t == "SMALLINT" || t == "INT2" || t == "SHORT") {
+			w = 6;
+		} else if (t == "TINYINT" || t == "INT1") {
+			w = 4;
+		} else if (t == "UINTEGER" || t == "UBIGINT") {
+			w = 20;
+		} else if (t == "USMALLINT" || t == "UTINYINT") {
+			w = 5;
+		} else if (t == "DOUBLE" || t == "FLOAT8" || t == "DOUBLE PRECISION") {
+			w = 25;
+		} else if (t == "FLOAT" || t == "FLOAT4" || t == "REAL") {
+			w = 15;
+		} else if (t == "TIMESTAMP" || t == "DATETIME" || t == "TIMESTAMP WITHOUT TIME ZONE" || t == "TIMESTAMPTZ" ||
+		           t == "TIMESTAMP WITH TIME ZONE" || t == "TIMESTAMP_S" || t == "TIMESTAMP_MS" ||
+		           t == "TIMESTAMP_NS") {
+			w = 27;
+		} else if (t == "DATE") {
+			w = 10;
+		} else if (t == "TIME" || t == "TIME WITHOUT TIME ZONE") {
+			w = 15;
+		} else if (t == "TIMETZ" || t == "TIME WITH TIME ZONE") {
+			w = 21;
+		} else if (t == "UUID") {
+			w = 36;
+		} else if (t == "BOOLEAN" || t == "BOOL" || t == "LOGICAL") {
+			w = 5;
+		} else if (t == "VARCHAR" || t == "TEXT" || t == "STRING" || t == "CHAR VARYING" || t == "CHARACTER VARYING" ||
+		           StringUtil::StartsWith(t, "VARCHAR(") || StringUtil::StartsWith(t, "CHAR(") ||
+		           StringUtil::StartsWith(t, "CHARACTER(")) {
+			w = 32;
+		} else if (t == "BLOB" || t == "BYTEA" || t == "BINARY" || t == "VARBINARY") {
+			w = 128;
+		} else {
+			w = 64; // DECIMAL, NUMERIC, INTERVAL, BIT, ENUM, LIST, STRUCT, MAP, …
+		}
+		bytes += w;
+	}
+	// CSV framing: one comma per column + newline per row.
+	bytes += static_cast<int64_t>(cols.size()) + 1;
+	return (bytes > 0) ? bytes : 1;
+}
+
+// Returns the exact row count if ≤ limit, otherwise -1.
+// Scans at most (limit+1) rows so large tables are never fully counted.
+int64_t QuickRowEstimate(Connection &con, const std::string &schema, const std::string &table, int64_t limit = 50000) {
+	const auto sql = "SELECT COUNT(*) FROM (SELECT 1 FROM " + QuoteIdent(schema) + "." + QuoteIdent(table) + " LIMIT " +
+	                 std::to_string(limit + 1) + ") __t";
+	auto result = con.Query(sql);
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return -1;
+	}
+	const int64_t n = result->GetValue(0, 0).GetValue<int64_t>();
+	return (n <= limit) ? n : -1;
+}
+
+// Build the MUTABLE_ENTITY rowid-statistics SQL (fallback / default).
+// Uses only COUNT + MIN + MAX — both answered from DuckDB zone-map statistics in ~59ms.
+std::string BuildMutableEntitySQL(const std::string &schema, const std::string &table) {
+	return "SELECT sha256(CAST(COUNT(*) AS VARCHAR) || '|' || "
+	       "COALESCE(CAST(MIN(rowid) AS VARCHAR), '') || '|' || "
+	       "COALESCE(CAST(MAX(rowid) AS VARCHAR), '')) AS table_hash, "
+	       "COUNT(*) AS row_count FROM " +
+	       QuoteIdent(schema) + "." + QuoteIdent(table);
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// ClassifyTable(): assign a FingerprintStrategy to a specific table.
+// See docs/fingerprinting.md §6.4 for the full classification hierarchy.
+// ---------------------------------------------------------------------------
+
+FingerprintStrategy ClassifyTable(Connection &con, const std::string &schema_name, const std::string &table_name,
+                                  const std::vector<std::pair<std::string, std::string>> &cols, bool is_base_snapshot) {
+	(void)is_base_snapshot; // classification is now identical for base and incremental snapshots
+
+	// ---- Structural classification ----
+
+	// EXACT: use full per-row sha256 when the estimated table size is below the 1 MB cost
+	// threshold. Threshold = estimated_bytes_per_row × row_count < 1 MB (1,048,576 bytes).
+	// This correctly promotes wide tables with few rows and demotes narrow tables with many rows.
+	static constexpr int64_t EXACT_BYTE_BUDGET = 1048576LL;
+	const int64_t bytes_per_row = EstimateBytesPerRow(cols);
+	const int64_t max_rows_for_budget = EXACT_BYTE_BUDGET / bytes_per_row;
+	const int64_t quick_count = QuickRowEstimate(con, schema_name, table_name, max_rows_for_budget);
+	const bool within_budget = (quick_count >= 0);
+
+	if (within_budget) {
+		try {
+			const auto rhe = RowHashExpr(cols);
+			const auto sql = "SELECT sha256(string_agg(rh, chr(10) ORDER BY rh)) AS table_hash, "
+			                 "COUNT(*) AS row_count FROM "
+			                 "(SELECT " +
+			                 rhe + " AS rh FROM " + QuoteIdent(schema_name) + "." + QuoteIdent(table_name) + ") __rows";
+			return FingerprintStrategy {"EXACT", sql,
+			                            "estimated ~" + std::to_string(quick_count * bytes_per_row) +
+			                                " bytes (<1 MB, " + std::to_string(quick_count) + " rows × " +
+			                                std::to_string(bytes_per_row) + " bytes/row), full per-row hash is cheap"};
+		} catch (...) {
+			// Unsupported column types in RowHashExpr — fall through to structural strategies.
+		}
+	}
+
+	// APPEND_ONLY: detect a monotonic integer PK column → COUNT + MAX(pk) (O(1)).
+	std::string append_col;
+	std::string append_reason;
+	for (const auto &col : cols) {
+		const auto lower = StringUtil::Lower(col.first);
+		if (IsIntegerType(col.second)) {
+			if (lower == "id" || lower == "pk" || lower == "seq" || lower == "rowno" || lower == "row_no" ||
+			    lower == "record_id" || StringUtil::EndsWith(lower, "_id") || StringUtil::StartsWith(lower, "pk_") ||
+			    StringUtil::EndsWith(lower, "_seq") || StringUtil::StartsWith(lower, "seq_")) {
+				append_col = col.first;
+				append_reason = "integer column '" + col.first + "' signals monotonic PK";
+				break;
+			}
+		}
+		if (IsTimestampType(col.second)) {
+			if (lower == "created_at" || lower == "inserted_at" || lower == "created" || lower == "inserted" ||
+			    StringUtil::EndsWith(lower, "_at") || StringUtil::EndsWith(lower, "_ts") ||
+			    StringUtil::EndsWith(lower, "_timestamp") || StringUtil::StartsWith(lower, "created_") ||
+			    StringUtil::StartsWith(lower, "inserted_")) {
+				append_col = col.first;
+				append_reason = "timestamp column '" + col.first + "' signals monotonic ordering";
+				break;
+			}
+		}
+	}
+
+	if (!append_col.empty()) {
+		const auto qc = QuoteIdent(append_col);
+		return FingerprintStrategy {"APPEND_ONLY",
+		                            "SELECT sha256(CAST(COUNT(*) AS VARCHAR) || '|' || "
+		                            "COALESCE(CAST(MAX(" +
+		                                qc +
+		                                ") AS VARCHAR), '')) AS table_hash, "
+		                                "COUNT(*) AS row_count FROM " +
+		                                QuoteIdent(schema_name) + "." + QuoteIdent(table_name),
+		                            append_reason};
+	}
+
+	// MUTABLE_ENTITY: default — COUNT + MIN/MAX(rowid) via DuckDB zone maps (O(1)).
+	return FingerprintStrategy {"MUTABLE_ENTITY", BuildMutableEntitySQL(schema_name, table_name),
+	                            "default strategy: COUNT + MIN/MAX(rowid) via zone maps (O(1))"};
+}
+
+// ---------------------------------------------------------------------------
+// ComputeTableFingerprint(): classify, execute strategy, return hash + metadata
 // ---------------------------------------------------------------------------
 
 TableFingerprint ComputeTableFingerprint(Connection &con, const std::string &schema_name, const std::string &table_name,
-                                         const std::vector<std::pair<std::string, std::string>> &cols) {
+                                         const std::vector<std::pair<std::string, std::string>> &cols,
+                                         bool is_base_snapshot) {
 	TableFingerprint fp;
 
 	if (cols.empty()) {
+		fp.strategy_name = "EMPTY";
+		fp.strategy_rationale = "table has no columns";
 		return fp;
 	}
 
-	const auto row_hash_expr = RowHashExpr(cols);
+	auto strategy = ClassifyTable(con, schema_name, table_name, cols, is_base_snapshot);
+	fp.strategy_name = strategy.name;
+	fp.strategy_rationale = strategy.rationale;
 
-	// Order-independent aggregate: sort row hashes before combining (spec §6.1).
-	// Sort (not XOR) preserves duplicate rows correctly.
-	// sha256 of empty table → NULL string_agg → empty table_hash.
-	const auto sql = StringUtil::Format(R"(
-SELECT
-    sha256(string_agg(rh, chr(10) ORDER BY rh)) AS tbl_hash,
-    COUNT(*) AS row_count
-FROM (
-    SELECT %s AS rh
-    FROM "%s"."%s"
-) __rows
-)",
-	                                    row_hash_expr, schema_name, table_name);
+	auto result = con.Query(strategy.sql);
+	if (result->HasError()) {
+		// Chosen strategy failed at runtime — fall back to MUTABLE_ENTITY.
+		fp.strategy_name = "MUTABLE_ENTITY_FALLBACK";
+		fp.strategy_rationale = "fallback after " + strategy.name + " failed: " + result->GetError();
+		result = con.Query(BuildMutableEntitySQL(schema_name, table_name));
+	}
 
-	auto result = con.Query(sql);
 	if (result->HasError()) {
 		throw Exception(ExceptionType::EXECUTOR, StringUtil::Format("table fingerprint failed for \"%s\".\"%s\": %s",
 		                                                            schema_name, table_name, result->GetError()));
+	}
+
+	if (result->RowCount() == 0 || result->GetValue(1, 0).IsNull()) {
+		return fp;
 	}
 
 	fp.row_count = result->GetValue(1, 0).GetValue<int64_t>();

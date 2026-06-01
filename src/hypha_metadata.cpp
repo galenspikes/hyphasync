@@ -1,10 +1,14 @@
 #include "hypha_metadata.hpp"
 
+#include "hypha_postgres.hpp"
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
+
+#include <mutex>
 
 namespace duckdb {
 
@@ -56,6 +60,8 @@ CREATE TABLE IF NOT EXISTS hypha.object_snapshot (
     content_hash VARCHAR,
     object_fingerprint VARCHAR,
     pk_columns VARCHAR,
+    hypha_object_id VARCHAR,
+    pg_table_name VARCHAR,
     captured_at TIMESTAMP DEFAULT current_timestamp
 );
 )";
@@ -84,6 +90,7 @@ CREATE TABLE IF NOT EXISTS hypha.table_snapshot (
     table_name VARCHAR,
     row_count UBIGINT,
     table_hash VARCHAR,
+    fingerprint_strategy VARCHAR,
     captured_at TIMESTAMP DEFAULT current_timestamp
 );
 )";
@@ -119,10 +126,6 @@ CREATE TABLE IF NOT EXISTS hypha.meta (
 );
 )";
 
-std::string SqlQuote(const std::string &value) {
-	return StringUtil::Replace(value, "'", "''");
-}
-
 } // namespace
 
 bool IsHyphaMetadataInitialized(Connection &con) {
@@ -151,28 +154,69 @@ void EnsureHyphaMetadata(Connection &con, const std::string &conn_string) {
 	Exec(con, CREATE_EVENT_LOG_SQL, "CREATE TABLE hypha.event_log");
 	Exec(con, CREATE_META_SQL, "CREATE TABLE hypha.meta");
 
-	// Migrations: safe to re-run; ADD COLUMN IF NOT EXISTS is idempotent.
-	con.Query("ALTER TABLE hypha.commit ADD COLUMN IF NOT EXISTS fingerprint_algo VARCHAR");
-	con.Query("ALTER TABLE hypha.object_snapshot ADD COLUMN IF NOT EXISTS pk_columns VARCHAR");
+	// Read stored schema version for migration decisions.
+	int stored_version = 0;
+	{
+		auto ver_res = con.Query("SELECT value FROM hypha.meta WHERE key = 'schema_version'");
+		if (!ver_res->HasError() && ver_res->RowCount() > 0 && !ver_res->GetValue(0, 0).IsNull()) {
+			try {
+				stored_version = std::stoi(ver_res->GetValue(0, 0).ToString());
+			} catch (...) {
+				stored_version = 0;
+			}
+		}
+	}
 
-	const auto seed_meta_sql = StringUtil::Format(R"(
+	// Guard: refuse to open a database written by a newer extension version.
+	if (stored_version > HYPHA_SCHEMA_VERSION) {
+		throw InvalidInputException(
+		    "hyphasync: database schema version %d is newer than extension version %d; upgrade the extension.",
+		    stored_version, HYPHA_SCHEMA_VERSION);
+	}
+
+	// Migration v1 → v2: add indexes and missing columns (idempotent, IF NOT EXISTS guards).
+	if (stored_version < 2) {
+		con.Query("CREATE INDEX IF NOT EXISTS idx_row_hash_table_commit "
+		          "ON hypha.row_hash(table_name, commit_id)");
+		con.Query("CREATE INDEX IF NOT EXISTS idx_object_snapshot_table_commit "
+		          "ON hypha.object_snapshot(table_name, commit_id)");
+		con.Query("ALTER TABLE hypha.commit ADD COLUMN IF NOT EXISTS fingerprint_algo VARCHAR");
+		con.Query("ALTER TABLE hypha.object_snapshot ADD COLUMN IF NOT EXISTS pk_columns VARCHAR");
+		con.Query("ALTER TABLE hypha.object_snapshot ADD COLUMN IF NOT EXISTS hypha_object_id VARCHAR");
+		con.Query("ALTER TABLE hypha.table_snapshot ADD COLUMN IF NOT EXISTS fingerprint_strategy VARCHAR");
+	}
+
+	// Migration v2 → v3: add pg_table_name for collision-safe identifier truncation.
+	if (stored_version < 3) {
+		con.Query("ALTER TABLE hypha.object_snapshot ADD COLUMN IF NOT EXISTS pg_table_name VARCHAR");
+	}
+
+	// Write the current schema version (covers fresh installs and post-migration updates).
+	const auto set_ver_sql =
+	    StringUtil::Format("INSERT INTO hypha.meta (key, value) VALUES ('schema_version', %s) "
+	                       "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()",
+	                       QuoteLiteral(std::to_string(HYPHA_SCHEMA_VERSION)));
+	con.Query(set_ver_sql);
+
+	const auto seed_meta_sql =
+	    StringUtil::Format(R"(
 INSERT INTO hypha.meta (key, value) VALUES
-    ('metadata_schema_version', '%s'),
-    ('fingerprint_algo', '%s'),
-    ('hyphasync_version', '%s')
+    ('metadata_schema_version', %s),
+    ('fingerprint_algo', %s),
+    ('hyphasync_version', %s)
 ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()
 )",
-	                                              SqlQuote(HYPHA_METADATA_SCHEMA_VERSION),
-	                                              SqlQuote(HYPHA_FINGERPRINT_ALGO), SqlQuote(HYPHASYNC_VERSION));
+	                       QuoteLiteral(HYPHA_METADATA_SCHEMA_VERSION), QuoteLiteral(HYPHA_FINGERPRINT_ALGO),
+	                       QuoteLiteral(HYPHASYNC_VERSION));
 	ThrowOnError(con.Query(seed_meta_sql), "SEED hypha.meta");
 
 	const auto upsert_sql = StringUtil::Format(R"(
 INSERT INTO hypha.target AS t (target_name, conn_string, last_commit_id)
-VALUES ('default', '%s', NULL)
+VALUES ('default', %s, NULL)
 ON CONFLICT (target_name) DO UPDATE SET
     conn_string = excluded.conn_string
 )",
-	                                           SqlQuote(conn_string));
+	                                           QuoteLiteral(conn_string));
 	ThrowOnError(con.Query(upsert_sql), "UPSERT hypha.target default row");
 }
 
@@ -180,14 +224,19 @@ void LogEvent(Connection &con, const std::string &level, const std::string &oper
               const std::string &message, const std::string &details_json) {
 	// Best-effort observability: the event_log table only exists once metadata is
 	// initialized, and a logging failure must never abort the caller's operation.
-	if (!IsHyphaMetadataInitialized(con)) {
+	// Use once_flag to guard the initialization check against concurrent calls from
+	// multiple threads (e.g., parallel table processing in HyphaSnapshotFunction).
+	static std::once_flag s_event_log_once;
+	static bool s_event_log_ok = false;
+	std::call_once(s_event_log_once, [&] { s_event_log_ok = IsHyphaMetadataInitialized(con); });
+	if (!s_event_log_ok) {
 		return;
 	}
-	const std::string details = details_json.empty() ? std::string("NULL") : ("'" + SqlQuote(details_json) + "'");
+	const std::string details = details_json.empty() ? std::string("NULL") : QuoteLiteral(details_json);
 	const auto sql = StringUtil::Format(
 	    R"(INSERT INTO hypha.event_log (event_id, level, operation, code, message, details_json)
-VALUES (uuid()::VARCHAR, '%s', '%s', '%s', '%s', %s))",
-	    SqlQuote(level), SqlQuote(operation), SqlQuote(code), SqlQuote(message), details);
+VALUES (uuid()::VARCHAR, %s, %s, %s, %s, %s))",
+	    QuoteLiteral(level), QuoteLiteral(operation), QuoteLiteral(code), QuoteLiteral(message), details);
 	con.Query(sql);
 }
 
@@ -233,13 +282,16 @@ std::string BuildDoctorReport(Connection &con) {
 	report += std::string("metadata_initialized=") + (initialized ? "true" : "false") + "\n";
 	report += "metadata_schema_version=" + std::string(HYPHA_METADATA_SCHEMA_VERSION) + "\n";
 	report += "fingerprint_algo=" + std::string(HYPHA_FINGERPRINT_ALGO) + "\n";
-	// Capability status: anything that is a scaffolded placeholder says so explicitly.
 	report += "capability_init=available\n";
 	report += "capability_target_status=available\n";
 	report += "capability_base_snapshot_plan=available\n";
 	report += "capability_base_snapshot=available\n";
-	report += "capability_sync_plan=available (SHA-256 fingerprint diff; detects all changes)\n";
-	report += "capability_sync=available (SHA-256 fingerprint diff; row-level diff planned for v2)\n";
+	report += "capability_sync_plan=available\n";
+	report += "capability_sync=available\n";
+	report += "nested_types=LIST/STRUCT/MAP → jsonb (requires json extension)\n";
+	report += "schema_evolution=ADD/DROP COLUMN without DROP+CREATE when possible\n";
+	report += "remote_metadata=hypha.sync_log and hypha.object_state written after each push\n";
+	report += "row_level_diff=targeted DELETE+INSERT for single and composite PKs\n";
 	report += "note=use hypha_target_status() to probe the Postgres target; hypha_base_snapshot() to push; "
 	          "hypha_sync() to sync";
 	return report;
@@ -258,6 +310,60 @@ std::string GetDefaultTargetConnString(Connection &con) {
 		return "";
 	}
 	return result->GetValue(0, 0).ToString();
+}
+
+int64_t GetMaxRowsPerTable(Connection &con) {
+	if (!IsHyphaMetadataInitialized(con)) {
+		return 0;
+	}
+	auto result = con.Query("SELECT value FROM hypha.meta WHERE key = 'max_rows_per_table'");
+	if (!result || result->HasError() || result->RowCount() == 0) {
+		return 0;
+	}
+	const auto val = result->GetValue(0, 0);
+	if (val.IsNull()) {
+		return 0;
+	}
+	try {
+		return std::stoll(val.ToString());
+	} catch (...) {
+		return 0;
+	}
+}
+
+void SetMaxRowsPerTable(Connection &con, int64_t limit) {
+	if (!IsHyphaMetadataInitialized(con)) {
+		return;
+	}
+	const auto sql = StringUtil::Format("INSERT INTO hypha.meta (key, value) VALUES ('max_rows_per_table', %s) "
+	                                    "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()",
+	                                    QuoteLiteral(std::to_string(limit)));
+	con.Query(sql);
+}
+
+bool GetFastMode(Connection &con) {
+	if (!IsHyphaMetadataInitialized(con)) {
+		return false;
+	}
+	auto result = con.Query("SELECT value FROM hypha.meta WHERE key = 'fast_mode'");
+	if (!result || result->HasError() || result->RowCount() == 0) {
+		return false;
+	}
+	const auto val = result->GetValue(0, 0);
+	if (val.IsNull()) {
+		return false;
+	}
+	return val.ToString() == "true";
+}
+
+void SetFastMode(Connection &con, bool fast_mode) {
+	if (!IsHyphaMetadataInitialized(con)) {
+		return;
+	}
+	const auto sql = StringUtil::Format("INSERT INTO hypha.meta (key, value) VALUES ('fast_mode', %s) "
+	                                    "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()",
+	                                    QuoteLiteral(fast_mode ? std::string("true") : std::string("false")));
+	con.Query(sql);
 }
 
 } // namespace duckdb

@@ -17,16 +17,59 @@ std::string FieldEncodingExpr(const std::string &col_expr, const std::string &du
 //! Row hash = sha256( join_0x1F( field_encoding(col) for each col in order ) )
 std::string RowHashExpr(const std::vector<std::pair<std::string, std::string>> &cols);
 
-//! Computes the table_hash for schema.table and returns it as a 64-char hex string.
-//! table_hash = sha256( string_agg(row_hash, chr(10) ORDER BY row_hash) )
-//! Also returns the exact row_count as a side-effect.
-//! Throws for any column type that cannot be canonicalized.
+// ---------------------------------------------------------------------------
+// Pluggable fingerprint strategy (v3 two-layer classifier)
+//
+// Layer 1 — Structural classifier (fast, schema-driven):
+//   APPEND_ONLY       integer PK / monotonic timestamp column → COUNT + MAX(signal_col)
+//   EXACT             estimated table bytes < 1 MB → full per-row sha256 (cheap, most precise)
+//   MUTABLE_ENTITY    default for large tables → COUNT + MIN/MAX/SUM of internal rowid
+//   WIDE_ANALYTICAL   >50 columns → COUNT + MIN/MAX of first 3 simple scalar columns
+//
+// Layer 2 — Domain-semantic strategies (pluggable, highest priority):
+//   CHEMINFORMATICS_COMPOUNDS  smiles/inchi/mol column → COUNT + MIN/MAX(mol_col)
+//   CHEMINFORMATICS_ASSAY      ic50/ec50/ki/activity column → COUNT + MIN/MAX/AVG(assay_col)
+// ---------------------------------------------------------------------------
+
+//! A strategy for computing the fingerprint of a specific table instance.
+//! Encapsulates the algorithm name, ready-to-run SQL, and human-readable rationale
+//! (logged to event_log and stored in hypha.table_snapshot.fingerprint_strategy).
+struct FingerprintStrategy {
+	std::string name;      //!< "APPEND_ONLY" | "EXACT" | "MUTABLE_ENTITY" | "WIDE_ANALYTICAL"
+	                       //!< "CHEMINFORMATICS_COMPOUNDS" | "CHEMINFORMATICS_ASSAY"
+	std::string sql;       //!< Ready-to-run SQL returning (table_hash VARCHAR, row_count BIGINT)
+	std::string rationale; //!< Why this strategy was chosen (for logging and observability)
+};
+
+//! Classify a table and return the fingerprint strategy to use.
+//! Classification priority (highest first):
+//!   1. Domain signals  — cheminformatics column name patterns (Layer 2)
+//!   2. Small cost      — estimated bytes < 1 MB → EXACT (full per-row hash, cheap)
+//!   3. Append signal   — integer PK / monotonic timestamp → APPEND_ONLY
+//!   4. Wide table      — >50 columns → WIDE_ANALYTICAL
+//!   5. Default         — MUTABLE_ENTITY (rowid statistics)
+//!
+//! is_base_snapshot is accepted for API compatibility but does not alter classification;
+//! EXACT and APPEND_ONLY are both O(1) or O(small) and are safe at snapshot time.
+FingerprintStrategy ClassifyTable(Connection &con, const std::string &schema_name, const std::string &table_name,
+                                  const std::vector<std::pair<std::string, std::string>> &cols,
+                                  bool is_base_snapshot = false);
+
+//! Result of ComputeTableFingerprint: hash, row count, and the chosen strategy.
 struct TableFingerprint {
 	std::string table_hash; //!< 64-char SHA-256 hex, or "" if table is empty
-	int64_t row_count;
+	int64_t row_count = 0;
+	std::string strategy_name;      //!< Strategy used (stored in hypha.table_snapshot)
+	std::string strategy_rationale; //!< Why this strategy was chosen (logged to event_log)
 };
+
+//! Classify this table, execute the chosen strategy SQL, and return the fingerprint.
+//! Falls back to MUTABLE_ENTITY if the chosen strategy SQL fails at runtime.
+//! Throws only for unrecoverable failures (MUTABLE_ENTITY fallback also fails).
+//! is_base_snapshot is accepted for API compatibility; classification is identical for both modes.
 TableFingerprint ComputeTableFingerprint(Connection &con, const std::string &schema_name, const std::string &table_name,
-                                         const std::vector<std::pair<std::string, std::string>> &cols);
+                                         const std::vector<std::pair<std::string, std::string>> &cols,
+                                         bool is_base_snapshot = false);
 
 //! Computes the definition_hash for a table from its column_snapshot rows.
 //! definition_hash = sha256( join_0x1F( schema, object, type, col metadata... ) )

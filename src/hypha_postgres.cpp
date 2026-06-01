@@ -6,6 +6,7 @@
 #include <chrono>
 #include <libpq-fe.h>
 #include <sstream>
+#include <thread>
 
 namespace duckdb {
 
@@ -117,7 +118,8 @@ CountResult RunCountQuery(PGconn *conn, const char *sql) {
 std::string FormatAttachReport(const std::string &status, const std::string &target_name, int64_t latency_ms,
                                const std::string &postgres_version, const std::string &database,
                                const std::string &user, const std::string &remote_hypha_schema,
-                               const std::string &remote_hypha_table_count, const std::string &error,
+                               const std::string &remote_hypha_table_count, const std::string &remote_hypha_sync_log,
+                               const std::string &remote_hypha_object_state, const std::string &error,
                                const std::string &error_code) {
 	std::ostringstream report;
 	report << "status=" << status << "\n";
@@ -134,6 +136,8 @@ std::string FormatAttachReport(const std::string &status, const std::string &tar
 	}
 	report << "remote_hypha_schema=" << remote_hypha_schema << "\n";
 	report << "remote_hypha_table_count=" << remote_hypha_table_count << "\n";
+	report << "remote_hypha_sync_log=" << remote_hypha_sync_log << "\n";
+	report << "remote_hypha_object_state=" << remote_hypha_object_state << "\n";
 	if (!error.empty()) {
 		report << "error=" << error << "\n";
 	}
@@ -184,7 +188,7 @@ std::string RedactConnString(const std::string &conn_string) {
 	return s;
 }
 
-PGconn *OpenHyphaConnection(const std::string &conn_string) {
+PGconn *OpenHyphaConnection(const std::string &conn_string, bool fast_mode) {
 	if (conn_string.empty()) {
 		throw InvalidInputException("no Postgres connection string provided; call hypha_init() first or pass a URL.");
 	}
@@ -207,6 +211,15 @@ PGconn *OpenHyphaConnection(const std::string &conn_string) {
 		    "could not connect to the Postgres target: %s. "
 		    "Verify the connection string, that the server is reachable, and that credentials are correct.",
 		    error);
+	}
+	// Suppress NOTICE-level messages (e.g. "schema already exists, skipping") from DDL
+	// statements that use IF NOT EXISTS / IF EXISTS. Warnings and errors still surface.
+	PQclear(PQexec(conn, "SET client_min_messages = warning"));
+	if (fast_mode) {
+		// Disable synchronous WAL flush only when fast_mode=true.
+		// This risks data loss on Postgres crash but is safe when hyphasync is a read replica
+		// and can re-run the snapshot/sync after recovery.
+		PQclear(PQexec(conn, "SET synchronous_commit = off"));
 	}
 	return conn;
 }
@@ -246,6 +259,12 @@ HyphaConnectionProbe ProbeHyphaConnection(const std::string &conn_string) {
 	}
 
 	probe.connected = true;
+	if (const char *h = PQhost(conn)) {
+		probe.host = h;
+	}
+	if (const char *p = PQport(conn)) {
+		probe.port = p;
+	}
 	const auto version = RunScalarQuery(conn, "SELECT version()");
 	if (version.ok) {
 		probe.postgres_version = version.value;
@@ -308,6 +327,10 @@ std::string RunHyphaTargetStatus(const std::string &conn_string, const std::stri
 	    RunCountQuery(conn, "SELECT COUNT(*)::BIGINT FROM information_schema.schemata WHERE schema_name = 'hypha'");
 	const auto table_count =
 	    RunCountQuery(conn, "SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = 'hypha'");
+	const auto sync_log_count = RunCountQuery(conn, "SELECT COUNT(*)::BIGINT FROM information_schema.tables "
+	                                                "WHERE table_schema = 'hypha' AND table_name = 'sync_log'");
+	const auto object_state_count = RunCountQuery(conn, "SELECT COUNT(*)::BIGINT FROM information_schema.tables "
+	                                                    "WHERE table_schema = 'hypha' AND table_name = 'object_state'");
 
 	PQfinish(conn);
 
@@ -353,10 +376,116 @@ std::string RunHyphaTargetStatus(const std::string &conn_string, const std::stri
 		note_failure("hypha table count", table_count.error, table_count.error_code);
 	}
 
+	const std::string remote_hypha_sync_log =
+	    sync_log_count.ok ? (sync_log_count.value > 0 ? "true" : "false") : "unknown";
+	const std::string remote_hypha_object_state =
+	    object_state_count.ok ? (object_state_count.value > 0 ? "true" : "false") : "unknown";
+
 	const std::string status = probe_errors.empty() ? "ok" : "degraded";
 
 	return FormatAttachReport(status, target_name, latency_ms, postgres_version.value, database.value, user.value,
-	                          remote_hypha_schema, remote_hypha_table_count, probe_errors, error_code);
+	                          remote_hypha_schema, remote_hypha_table_count, remote_hypha_sync_log,
+	                          remote_hypha_object_state, probe_errors, error_code);
+}
+
+void PGExecWithRetry(PGconn *&conn, const std::string &connstring, const std::string &sql, const char *context,
+                     int max_retries, bool fast_mode) {
+	for (int attempt = 0; attempt <= max_retries; attempt++) {
+		// Reconnect if the connection is bad.
+		if (PQstatus(conn) != CONNECTION_OK) {
+			PQreset(conn);
+			if (PQstatus(conn) != CONNECTION_OK) {
+				PQfinish(conn);
+				conn = PQconnectdb(connstring.c_str());
+				if (!conn || PQstatus(conn) != CONNECTION_OK) {
+					const std::string err = conn ? Clean(PQerrorMessage(conn)) : "out of memory";
+					if (conn) {
+						PQfinish(conn);
+						conn = nullptr;
+					}
+					throw IOException(StringUtil::Format("%s: reconnect failed: %s", context, err));
+				}
+				// Re-apply session settings after a fresh connect.
+				PQclear(PQexec(conn, "SET client_min_messages = warning"));
+				if (fast_mode) {
+					PQclear(PQexec(conn, "SET synchronous_commit = off"));
+				}
+			}
+		}
+
+		PGresult *res = PQexec(conn, sql.c_str());
+		if (!res) {
+			if (attempt < max_retries) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(100 * (attempt + 1)));
+				continue;
+			}
+			throw IOException(
+			    StringUtil::Format("%s: PQexec returned null after %d attempts (out of memory)", context, max_retries));
+		}
+
+		const ExecStatusType status = PQresultStatus(res);
+		if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
+			PQclear(res);
+			return;
+		}
+
+		// Check for transient error codes: 40001 (serialization), 40P01 (deadlock), 08* (connection).
+		const std::string sqlstate = Clean(PQresultErrorField(res, PG_DIAG_SQLSTATE));
+		const std::string errmsg = Clean(PQresultErrorMessage(res));
+		PQclear(res);
+
+		const bool is_transient = (sqlstate.size() >= 2 && sqlstate.substr(0, 2) == "40") ||
+		                          (sqlstate.size() >= 2 && sqlstate.substr(0, 2) == "08") || sqlstate.empty();
+
+		if (is_transient && attempt < max_retries) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(100 * (attempt + 1)));
+			continue;
+		}
+
+		throw IOException(StringUtil::Format("%s: %s", context, errmsg));
+	}
+}
+
+std::string QuoteIdent(const std::string &name) {
+	std::string out = "\"";
+	for (const char c : name) {
+		if (c == '"') {
+			out += '"';
+		}
+		out += c;
+	}
+	out += '"';
+	return out;
+}
+
+std::string QuoteLiteral(const std::string &val) {
+	std::string out = "'";
+	for (const char c : val) {
+		if (c == '\'') {
+			out += '\'';
+		} else if (c == '\\') {
+			out += '\\';
+		}
+		out += c;
+	}
+	out += '\'';
+	return out;
+}
+
+void LogEventRemote(PGconn *pg, const std::string &db_name, const std::string &level, const std::string &operation,
+                    const std::string &code, const std::string &message, const std::string &details_json) {
+	if (!pg || PQstatus(pg) != CONNECTION_OK) {
+		return;
+	}
+	// Parameterized to avoid quoting issues with arbitrary message text.
+	const char *values[5] = {db_name.c_str(), level.c_str(), operation.c_str(), code.c_str(), message.c_str()};
+	PGresult *res = PQexecParams(pg,
+	                             "INSERT INTO hypha.event_log (db_name, level, operation, code, message) "
+	                             "VALUES ($1, $2, $3, $4, $5)",
+	                             5, nullptr, values, nullptr, nullptr, 0);
+	if (res) {
+		PQclear(res);
+	}
 }
 
 } // namespace duckdb
