@@ -153,7 +153,8 @@ INSERT INTO synthetic.build_manifest (key, value) VALUES
     ('source_ferc6',   'ferc6-xbrl.duckdb'),
     ('source_ferc60',  'ferc60-xbrl.duckdb'),
     ('schemas',        'analytics,grid,pipeline,gas,synthetic'),
-    ('purpose',        'hyphasync stress-test / type-coverage frankenstein DB');
+    ('purpose',        'hyphasync stress-test / type-coverage frankenstein DB'),
+    ('see_also',       'scripts/build-cheminformatics.sh for 1B+ row domain DB');
 SQL
 echo "  [synthetic] done"
 

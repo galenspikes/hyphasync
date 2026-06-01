@@ -6,22 +6,23 @@
 
 **Full sync pipeline working (experimental).**
 
-All six workflow functions are implemented. The sync is correct: fingerprinting detects every change including same-count row updates and deletes that row-count-only approaches miss.
+All workflow functions are implemented and end-to-end tested.
 
 | Capability | Status |
 |------------|--------|
 | Local metadata + Postgres target verification | ✅ |
 | Read-only Postgres health probe | ✅ |
 | Local catalog snapshot (object/column/table) | ✅ |
-| SHA-256 fingerprinting (table_hash, definition_hash) | ✅ |
+| SHA-256 fingerprinting v3 — EXACT/APPEND_ONLY/MUTABLE_ENTITY strategies | ✅ |
 | Base snapshot: DuckDB → Postgres COPY | ✅ |
 | Incremental sync with fingerprint diff | ✅ |
-| Row-level diff: single-column PKs | ✅ |
-| Row-level diff: composite PKs | ✅ |
-| No-PK tables | ✅ TRUNCATE+COPY fallback |
-| Remote `hypha` metadata on Postgres | planned |
-| Nested type fingerprinting (LIST/STRUCT/MAP) | planned |
-| Targeted schema evolution DDL | planned |
+| Row-level diff: single and composite PKs | ✅ |
+| No-PK tables | ✅ TRUNCATE+COPY fallback (logged to event_log) |
+| Nested types: LIST/STRUCT/MAP → `jsonb` | ✅ requires `json` extension |
+| Targeted schema evolution: ADD/DROP COLUMN without DROP+CREATE | ✅ |
+| Remote `hypha` metadata on Postgres | ✅ `hypha.sync_log` + `hypha.object_state` |
+| tables_failed / rows_failed tracking with WARNING output | ✅ |
+| Real-time event_log mirroring to Postgres | ✅ dedicated autocommit connection |
 | CDC / WAL / streaming replication | non-goal |
 
 ## Quick start
@@ -52,6 +53,9 @@ CC=gcc CXX=g++ make release
 ```sql
 LOAD hyphasync;
 
+-- Optional: install JSON extension for LIST/STRUCT/MAP column support
+INSTALL json; LOAD json;
+
 -- 1. Confirm extension is loaded and inspect capabilities
 SELECT hypha_hello();
 SELECT hypha_doctor();
@@ -60,8 +64,8 @@ SELECT hypha_doctor();
 SELECT hypha_init('postgresql://user:pass@host:5432/dbname');
 
 -- 3. Probe the target (read-only; no remote writes)
-SELECT hypha_target_status(NULL);   -- uses stored default target
-SELECT hypha_target_status('postgresql://...');  -- explicit URL
+SELECT hypha_target_status(NULL);           -- uses stored default target
+SELECT hypha_target_status('postgresql://...'); -- explicit URL
 
 -- 4. Capture local catalog + fingerprints (no Postgres writes)
 SELECT hypha_base_snapshot_plan();
@@ -70,17 +74,15 @@ SELECT * FROM hypha.column_snapshot;   -- columns with DuckDB→Postgres type ma
 SELECT * FROM hypha.table_snapshot;    -- row counts and SHA-256 table_hash
 
 -- 5. Push to Postgres for the first time
-SELECT hypha_base_snapshot();
+SELECT * FROM hypha_base_snapshot();
 -- Creates schema <dbname>_<duckschema> (e.g. mydb_main) on Postgres,
--- copies every table via COPY FROM STDIN. Re-running drops and re-copies.
+-- copies every table via COPY FROM STDIN. Returns one row per table.
 
--- 6. After changes in DuckDB, see what would sync
+-- 6. After changes in DuckDB, preview what would sync
 SELECT hypha_sync_plan();
--- Detects: new tables, dropped tables, schema changes, data changes
--- (including same-count updates/deletes via table_hash diff)
 
 -- 7. Apply the sync
-SELECT hypha_sync();
+SELECT * FROM hypha_sync();
 
 -- 8. Inspect observability
 SELECT * FROM hypha.event_log ORDER BY event_time DESC;
@@ -95,7 +97,7 @@ CC=gcc CXX=g++ make release
 
 Artifacts:
 
-- `./build/release/duckdb` — shell with extension linked in
+- `./build/release/duckdb` — DuckDB shell with extension linked in (no `LOAD` needed)
 - `./build/release/test/unittest` — SQL test runner
 - `./build/release/extension/hyphasync/hyphasync.duckdb_extension` — loadable binary
 
@@ -109,18 +111,32 @@ make test
 
 Extension-specific tests live in `test/sql/hyphasync.test`.
 
-## Integration checks
+## Integration tests
 
-Requires Docker + Docker Compose.
+The integration test suite runs against a Postgres 16 instance on port 54329. The script auto-detects whether native Postgres is available and falls back to Docker Compose if not.
+
+### Option A — Docker Compose (no local Postgres required)
 
 ```sh
-./scripts/verify-phase0.sh   # catalog + snapshot + event_log + mutation guard
-./scripts/verify-phase1.sh   # deeper probe coverage + type mapping + idempotency
+./test/integration/run.sh
 ```
 
-## Testing against sample databases
+Docker must be running. The script starts the Postgres container from `docker-compose.yml` automatically.
 
-Download real-world DuckDB databases and run the full sync harness against them:
+### Option B — Native Postgres
+
+If you already have Postgres 16 running locally, provision the test user and database first (one-time, idempotent):
+
+```sh
+./scripts/setup-postgres-test.sh        # creates hypha role + hypha_test db on port 54329
+./test/integration/run.sh
+```
+
+### What it covers
+
+Init, snapshot plan, type mapping, fingerprinting, base snapshot push, incremental sync, schema evolution, nested types, remote metadata, composite PKs, large table fingerprint strategies, max-rows guard, and basic resilience.
+
+## Testing against sample databases
 
 ```sh
 ./scripts/download-testdata.sh        # TPC-H, FERC XBRL, Stack Overflow stats
@@ -130,16 +146,47 @@ Download real-world DuckDB databases and run the full sync harness against them:
 
 ## Fingerprinting
 
-hyphasync uses SHA-256 fingerprinting to detect all data changes:
+hyphasync uses SHA-256 fingerprinting (algorithm version `v3`) to detect all data changes:
 
-- Every row is hashed with a canonical type-aware encoding (`field_encoding_expr`).
+- Every row is hashed with a canonical type-aware encoding per `docs/fingerprinting.md`.
 - `table_hash = sha256(sort(row_hashes))` — order-independent and duplicate-correct.
-- `definition_hash` covers schema structure (column names, types, nullability).
-- `object_fingerprint = sha256(definition_hash + ":" + table_hash)` — one comparison to rule them all.
+- `definition_hash` covers schema structure (column names, types, nullability, PK columns).
+- `object_fingerprint = sha256(definition_hash + ":" + table_hash)` — one comparison answers "did anything change?"
 
-All hashing is done inside DuckDB (vectorized, parallel) using its built-in `sha256()` function. Fingerprints are never compared cross-engine. See [docs/fingerprinting.md](docs/fingerprinting.md) for the frozen v1 spec.
+All hashing runs inside DuckDB (never Postgres). Nested types (LIST/STRUCT/MAP) use DuckDB's JSON serialization as the canonical payload (tags `L`/`R`/`M`). See [docs/fingerprinting.md](docs/fingerprinting.md).
 
-## Schema mapping
+v3 uses a cost-based strategy classifier per table:
+
+| Strategy | When used | Cost |
+|----------|-----------|------|
+| **EXACT** | Estimated serialized size < 1 MB | O(n) full per-row SHA-256 (fast in practice — table is small) |
+| **APPEND_ONLY** | Table has a monotonic integer PK or timestamp column | O(1) via `COUNT(*) + MAX(pk)` |
+| **MUTABLE_ENTITY** | Everything else | O(1) via `COUNT(*) + MIN/MAX(rowid)` zone-map statistics |
+
+If you have a baseline from an older algorithm version, run `hypha_base_snapshot()` once to re-establish a v3 baseline. `hypha_sync()` refuses to diff across algorithm versions and tells you exactly what to do.
+
+From R, prefer the repo CLI over loading the extension in CRAN `{duckdb}` — see [docs/r.md](docs/r.md).
+
+## Type mapping
+
+| DuckDB | Postgres |
+|--------|----------|
+| `INTEGER`, `INT4` | `integer` |
+| `BIGINT` | `bigint` |
+| `DECIMAL(p,s)` | `numeric(p,s)` |
+| `DOUBLE`, `FLOAT` | `double precision`, `real` |
+| `VARCHAR`, `TEXT` | `text` |
+| `TIMESTAMP` / `TIMESTAMPTZ` | `timestamp without/with time zone` |
+| `TIMESTAMP_S` / `TIMESTAMP_MS` / `TIMESTAMP_NS` | `timestamp without time zone` (sub-second precision is coerced; logged as TYPE_COERCE) |
+| `DATE`, `TIME`, `TIMETZ` | `date`, `time without/with time zone` |
+| `UUID`, `BOOLEAN`, `BLOB` | `uuid`, `boolean`, `bytea` |
+| `INTERVAL`, `BIT` | `interval`, `bit varying` |
+| `JSON` | `jsonb` |
+| `T[]`, `LIST(T)`, `STRUCT(...)`, `MAP(...)` | `jsonb` (requires `json` extension) |
+
+Columns whose types have no safe mapping are logged to `hypha.event_log` and excluded from the push; the rest of the table syncs normally.
+
+## Schema mapping and ownership
 
 Postgres schemas are named `<duckdb_filename>_<duckdb_schema>`:
 
@@ -148,7 +195,7 @@ Postgres schemas are named `<duckdb_filename>_<duckdb_schema>`:
 | `mydb.duckdb` / `main` | `mydb_main` |
 | `analytics.duckdb` / `reports` | `analytics_reports` |
 
-Column types are mapped from DuckDB to Postgres (e.g. `DECIMAL(10,2)` → `numeric(10,2)`, `TIMESTAMPTZ` → `timestamp with time zone`). Unsupported nested types (LIST/STRUCT/MAP) are skipped with a `warn` entry in `hypha.event_log` — planned for a future release.
+**hyphasync exclusively owns its target Postgres schemas.** Running `hypha_base_snapshot()` drops and recreates every table in those schemas. If the schema already contains tables not created by a prior hyphasync push, a `SCHEMA_OWNERSHIP_WARNING` is emitted to `hypha.event_log` before overwriting. Do not point hyphasync at a schema that holds data you care about outside of hyphasync.
 
 ## Sync behaviour by PK type
 
@@ -156,24 +203,38 @@ Column types are mapped from DuckDB to Postgres (e.g. `DECIMAL(10,2)` → `numer
 |----------|-------------|
 | Single-column PK | Targeted DELETE + INSERT for changed rows only |
 | Composite PK | Same — compound key used for row identity |
-| No PK | TRUNCATE + COPY (correct, not as efficient) |
+| No PK | TRUNCATE + COPY (correct, but full table; logged as `TRUNCATE_COPY` in event_log) |
 
-The sync first computes `table_hash` (SHA-256 of all row hashes) to detect whether any data changed. If the hash matches the prior snapshot, the table is skipped entirely — zero Postgres work regardless of row count. Only changed tables trigger any row-level operations.
+## Remote metadata on Postgres
+
+After every successful push or sync, hyphasync writes bookkeeping rows into a `hypha` schema on the Postgres target:
+
+| Table | Contents |
+|-------|----------|
+| `hypha.sync_log` | One row per push/sync: source database, commit IDs, table/row counts |
+| `hypha.object_state` | Current fingerprint state of each synced table |
+
+Use `hypha_target_status()` to inspect `remote_hypha_sync_log` and `remote_hypha_object_state`.
 
 ## SQL surface
 
-| Function | Status | Description |
-|----------|--------|-------------|
-| `hypha_hello()` | available | Confirms extension is loaded |
-| `hypha_doctor()` | available | Versions, local DB identity, capability status |
-| `hypha_init(conn VARCHAR)` | available | Verify Postgres connectivity, create local `hypha` metadata |
-| `hypha_target_status(conn VARCHAR)` | available | Read-only Postgres probe (status=ok/degraded/error) |
-| `hypha_base_snapshot_plan()` | available | Catalog walk + SHA-256 fingerprinting; no remote writes |
-| `hypha_base_snapshot()` | available | Push all tables to Postgres via COPY |
-| `hypha_sync_plan()` | available | Fingerprint diff against last applied snapshot |
-| `hypha_sync()` | available | Apply diff: new/changed tables COPY, dropped tables DROP |
+| Function | Return type | Description |
+|----------|-------------|-------------|
+| `hypha_hello()` | `VARCHAR` | Confirms extension is loaded |
+| `hypha_doctor()` | `VARCHAR` | Versions, local DB identity, capability inventory |
+| `hypha_init(conn VARCHAR)` | `BOOLEAN` | Verify Postgres connectivity, create local `hypha` metadata |
+| `hypha_init(conn VARCHAR, max_rows BIGINT)` | `BOOLEAN` | Same; skip tables with row_count > max_rows |
+| `hypha_init(conn VARCHAR, max_rows BIGINT, fast_mode BOOLEAN)` | `BOOLEAN` | Same; fast_mode=true sets `synchronous_commit=off` (see note below) |
+| `hypha_target_status(conn VARCHAR)` | `VARCHAR` | Read-only Postgres probe (status=ok/degraded) |
+| `hypha_base_snapshot_plan()` | `VARCHAR` | Catalog walk + SHA-256 fingerprinting; no remote writes |
+| `SELECT * FROM hypha_base_snapshot()` | `TABLE(table_name VARCHAR, row_count BIGINT, fingerprint_strategy VARCHAR, duration_ms DOUBLE, status VARCHAR)` | Push all tables to Postgres via COPY; one row per table |
+| `hypha_sync_plan()` | `VARCHAR` | Fingerprint diff against last applied snapshot; no remote writes |
+| `SELECT * FROM hypha_sync()` | `TABLE(table_name VARCHAR, action VARCHAR, rows_synced BIGINT, duration_ms DOUBLE, status VARCHAR)` | Apply incremental sync; one row per changed table |
+| `hypha_help([name VARCHAR])` | `VARCHAR` | List all functions or describe a specific one |
 
-`hypha_doctor()` reports each capability's status and the active `fingerprint_algo`.
+> **fast_mode note:** `fast_mode=true` sets `synchronous_commit=off` on every Postgres connection opened by hyphasync. This skips WAL flushing on commit, which can significantly speed up large base snapshots and syncs, but means committed data **can be lost on a Postgres crash** (the last few committed pages may not reach disk). This is safe when hyphasync is used purely as a read replica — a lost commit can be recovered by re-running `hypha_base_snapshot()`.
+
+See [docs/functions.md](docs/functions.md) for full reference: arguments, return value format, event_log codes, and use cases for each function.
 
 ## Local metadata schema
 
@@ -186,9 +247,18 @@ Extension-owned schema: `hypha`
 | `hypha.object_snapshot` | Per-table `definition_hash`, `content_hash`, `object_fingerprint` |
 | `hypha.column_snapshot` | Per-column DuckDB→Postgres type mapping |
 | `hypha.table_snapshot` | Per-table row count and `table_hash` |
-| `hypha.row_hash` | Reserved for v2 row-level diff |
+| `hypha.row_hash` | Per-row PK+hash pairs for row-level diff |
 | `hypha.event_log` | All operations logged with level/code/message |
 | `hypha.meta` | Config: `metadata_schema_version`, `fingerprint_algo`, `hyphasync_version` |
+
+## Limitations & known issues
+
+- **In-place update blind spot for MUTABLE_ENTITY:** The `MUTABLE_ENTITY` fingerprint strategy (used for large tables) tracks row-ID statistics. An in-place update that replaces one value with a value of identical statistical signature (same min/max/count) will not be detected as a change.
+- **Keyless tables use TRUNCATE+COPY:** Tables without a primary key cannot use row-level diff (DELETE+INSERT). Every sync re-copies the full table. This is correct but potentially slow for large tables.
+- **`synchronous_commit=off` data-loss window:** When `fast_mode=true`, committed Postgres data may be lost if Postgres crashes before the WAL is flushed to disk. Safe only for read-replica use cases; recoverable by re-running `hypha_base_snapshot()`.
+- **OFFSET pagination cost for non-integer PKs:** Tables without a single-column integer PK use `LIMIT/OFFSET` for chunk pagination during COPY, which is O(n) in the offset depth. For very large tables with composite or non-integer PKs, the last chunks may be slow.
+- **Postgres 8 KB row limit for wide fixed-width tables:** Tables with many integer/numeric/date columns (hundreds of fixed-width columns) can exceed Postgres's 8 KB per-heap-row limit even after `SET STORAGE EXTERNAL` on varlena columns. Affected tables fail COPY with "row is too big" and are logged as `TABLE_FAIL` with the error message. Text-heavy tables are not affected (varlena columns are stored out-of-line via TOAST).
+- **`hypha_init()` renders a result box:** Because `hypha_init` is a scalar function returning BOOLEAN, DuckDB renders a small result box. The useful output (connection status) is on stderr. Use `SELECT hypha_init(...) IS NOT NULL;` or pipe stderr to suppress the box.
 
 ## Non-goals
 
@@ -199,7 +269,9 @@ Extension-owned schema: `hypha`
 
 ## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for planned v2 features.
+Experimental — quality and large-workload validation come before new features or release packaging. See [docs/ROADMAP.md](docs/ROADMAP.md).
+
+If you upgrade DuckDB later: [docs/upgrading-duckdb.md](docs/upgrading-duckdb.md). For day-to-day use, prefer the repo-built `./build/release/duckdb` CLI over loading the extension into CRAN `{duckdb}`.
 
 ## License
 

@@ -1,66 +1,114 @@
 # hyphasync roadmap
 
-## Completed
+**Status: experimental.** The sync pipeline is implemented end-to-end, but we have not yet established acceptable quality on real workloads (large tables, wide schemas, long-running syncs, failure recovery). Release engineering and multi-client packaging come **after** that bar is met.
 
-### Phase 0 — local metadata scaffold
-- `hypha_hello()`, `hypha_doctor()`, `hypha_init()`
-- Local `hypha` schema and metadata tables
-- `hypha_init()` always verifies Postgres connectivity before writing anything
-- Password redaction in all output; `hypha.event_log` live; `hypha.meta` config table
+**Last reviewed:** 2026-05-31  
+**Version:** `0.2.0` · **DuckDB build pin:** `v1.5.2` · **Fingerprint:** `v2`
 
-### Phase 1 — Postgres attach and health checks
-- `hypha_target_status(conn_string)` — read-only libpq probe (connect, `version()`, remote `hypha` schema inventory)
-- Throws on hard failures; returns `status=ok|degraded` with SQLSTATE on connected-but-broken probes
+---
 
-### Phase 2 — catalog snapshot and fingerprinting
-- `hypha_base_snapshot_plan()` — full local catalog walk; populates `object_snapshot`, `column_snapshot`, `table_snapshot`
-- SHA-256 fingerprinting (v1): `table_hash`, `definition_hash`, `object_fingerprint`
-- Frozen spec: [docs/fingerprinting.md](fingerprinting.md)
-- DuckDB→Postgres type mapper covering all common scalar types
-- `fingerprint_algo` recorded on every `hypha.commit`
+## Current focus — prove it works
 
-### Phase 3 — base snapshot (DuckDB → Postgres)
-- `hypha_base_snapshot()` — creates Postgres schemas (`<dbname>_<schema>`), copies all tables via `COPY FROM STDIN`
-- `SET STORAGE EXTERNAL` for text columns avoids Postgres 8 KB row-size limit on wide tables
-- Per-table savepoints: wide/unsupported tables skip with `event_log` warn, rest succeed
-- Identifier truncation with collision disambiguation for Postgres's 63-char limit
+Before new features or chasing upstream DuckDB releases:
 
-### Phase 4 — incremental sync
-- `hypha_sync_plan()` — fingerprint-first diff: `object_fingerprint` → `definition_hash` → `table_hash` → row_count
-- `hypha_sync()` — applies plan: new tables CREATE+COPY, dropped tables DROP, data changes TRUNCATE+COPY
-- Detects all changes including same-count row updates/deletes via `table_hash` diff
-- Graceful fallback to column-signature + row-count for pre-fingerprint snapshots
-- Version-mismatch warning when syncing against an unfingerprinted prior snapshot
+| Priority | What “done” looks like |
+|----------|------------------------|
+| **Correctness** | Integration tests green; sample-DB harness passes on frankenstein + at least one multi-GB DB; row counts and types match on Postgres |
+| **Scale** | Baseline timings recorded in `testdata/results/` for TPC-H, cheminformatics, HTS-scale tables; failures documented not silent |
+| **Failure modes** | Skipped tables, partial sync, connection loss, and schema edge cases produce clear `hypha.event_log` entries |
+| **Operability** | `./scripts/test-sample-dbs.sh` is the repeatable “woodchipper”; results are comparable run-to-run |
 
-### Phase 5 — Row-level diff (single + composite PKs)
-- `hypha.row_hash` populated with SHA-256 per-row hashes keyed by compound PK key
-- PK detection from `duckdb_constraints()` — single-column and composite PKs both supported
-- `ApplyRowLevelDiff()`: targeted DELETE + INSERT for changed rows; TRUNCATE+COPY fallback for no-PK tables
-- Fingerprint version enforcement: refuses to diff across algo versions
-- pk_json format: chr(31)-separated compound key (no JSON extension required)
+Open questions we are still answering with real data:
 
-## Next
+- How long does a 1B-row table take to fingerprint + COPY?
+- Where do we hit Postgres or libpq limits (row size, identifier length, memory)?
+- Is incremental sync actually cheaper than re-push for our typical change patterns?
 
-### Remote `hypha` metadata
-- Create a `hypha` schema on the Postgres target recording what was pushed and when
-- Enables audit from Postgres, resumable syncs, multi-source scenarios
+---
 
-### Nested type support (LIST/STRUCT/MAP)
-- Fingerprinting: canonical encoding for LIST (in-order), STRUCT (field order), MAP (sorted keys)
-- Type mapping: LIST → Postgres array, STRUCT/MAP → JSONB
+## Shipped (0.2.0)
 
-### Remote `hypha` metadata
-- Mirror sync state on the Postgres target (extension-owned `hypha` schema on the remote side)
-- Enable resumable syncs and remote audit history
+Experimental but complete as a **vertical slice**:
 
-### Object lineage and comments
-- Persist lineage comments and object-level provenance
-- Tie `hypha.object_snapshot` rows to catalog objects
+- `hypha_init` → `hypha_base_snapshot_plan` → `hypha_base_snapshot` → `hypha_sync_plan` → `hypha_sync`
+- Fingerprinting v2, row-level diff (PK tables), schema evolution (ADD/DROP), nested types → jsonb
+- Remote `hypha.sync_log` / `hypha.object_state` on Postgres
+- Test harness: `make test`, `./test/integration/run.sh`, `./scripts/test-sample-dbs.sh`
 
-### Fingerprint version migration
-- Detect `fingerprint_algo` mismatch between old and new snapshots
-- Force full re-snapshot on version mismatch rather than a partial ambiguous diff
+---
 
-### Watermark-column optimization
-- Optional user-declared `updated_at` column to bound row scans
-- Avoids full-table hash on tables with a reliable watermark
+## Next (after quality bar)
+
+Work we want but **not before** the focus items above are satisfied:
+
+| Item | Why it waits |
+|------|--------------|
+| Watermark-column optimization | Needs proof full-table hash is the bottleneck |
+| Parallel table COPY | Needs baseline to measure improvement |
+| Progress reporting on long syncs | UX; useless if sync is wrong |
+| Fingerprint migration UX polish | Edge case until we have real rebaseline stories |
+| Object lineage / comments | Nice metadata; not core sync |
+
+### Non-goals
+
+- CDC / WAL / streaming replication
+- Postgres → DuckDB
+- Multi-target or non-Postgres databases
+
+---
+
+## Clients — conservative stance
+
+**Supported path today:** the DuckDB binary built from this repo (`./build/release/duckdb`), with hyphasync linked in. Shell scripts and SQL files call that binary directly.
+
+**R, Python, and other bindings:** query DuckDB files freely with `{duckdb}` / `duckdb` — that does not require hyphasync. **Running sync from inside CRAN `{duckdb}` is not a supported workflow yet.** Extension binaries are tied to a specific DuckDB engine version; CRAN updates on its own schedule. We do not want R users managing version pairs.
+
+When R integration matters, the plan is a **conservative wrapper** (call the known-good CLI from R via `system2` / `processx`) rather than `LOAD` of a loose `.duckdb_extension` into whatever DuckDB version `{duckdb}` shipped today. Until that wrapper exists and is tested, use the CLI.
+
+See [docs/upgrading-duckdb.md](upgrading-duckdb.md) for what happens when *you* upgrade DuckDB — written for when that becomes relevant, not something to worry about now.
+
+---
+
+## Testdata & stress infrastructure
+
+| Asset | Script | Role |
+|-------|--------|------|
+| Public samples | `scripts/download-testdata.sh` | TPC-H, FERC/PUDL |
+| `frankenstein.duckdb` | `scripts/build-frankenstein.sh` | Multi-schema type coverage |
+| `cheminformatics.duckdb` | `scripts/build-cheminformatics.sh` | Domain-scale tox/chem |
+| `hts-pipeline.duckdb` | `scripts/build-hts.sh` | HTS well/DR firehose |
+| Results | `testdata/results/*.jsonl` | Benchmark history |
+
+`testdata/` may symlink to external storage (e.g. `/Volumes/alpha/hyphasync-testdata`).
+
+---
+
+## Maintainer notes
+
+For **us**, not end users. Submodule bump procedure: [docs/UPDATING.md](UPDATING.md). User-facing upgrade story: [docs/upgrading-duckdb.md](upgrading-duckdb.md).
+
+### Build pins (internal)
+
+| Dependency | Pin |
+|------------|-----|
+| DuckDB | `v1.5.2` (submodule + CI) |
+| extension-ci-tools | `@v1.5-variegata` |
+| libpq | system / Homebrew |
+| Postgres (tests) | 16; native port 54329 (preferred), Docker Compose fallback |
+
+We bump DuckDB when we need a fix or when preparing a release — not on every upstream patch. DuckDB 2.0 (Fall 2026) is on the radar; no action until quality work is done.
+
+### Bump checklist (when we decide to)
+
+- Submodule + extension-ci-tools + CI workflow version
+- `make release`, `make test`, `./test/integration/run.sh`
+- Sample-DB harness on large testdata
+- Update pins in this file and [upgrading-duckdb.md](upgrading-duckdb.md)
+
+---
+
+## References
+
+- [docs/functions.md](functions.md) — SQL surface
+- [docs/fingerprinting.md](fingerprinting.md) — v2 spec
+- [docs/upgrading-duckdb.md](upgrading-duckdb.md) — user upgrade guide (when relevant)

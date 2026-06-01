@@ -1,14 +1,18 @@
-# hyphasync fingerprinting & hashing — spec v1
+# hyphasync fingerprinting & hashing — spec v1 / v2
 
-Status: **implemented (v1)**. The frozen rules below are in production in
+Status: **v3 implemented**. The rules below are in production in
 `src/hypha_fingerprint.cpp`. All workflow functions (`hypha_base_snapshot_plan`,
 `hypha_base_snapshot`, `hypha_sync_plan`, `hypha_sync`) compute and use
 fingerprints. Tracked in [ROADMAP.md](ROADMAP.md).
 
+v3 replaces the O(n) full-row sha256 scan with a fast rowid-statistics fingerprint
+(see §6.4). v2 column type encoding (`FieldEncodingExpr`, `RowHashExpr`) is retained
+for row-level diff in `hypha.row_hash` but is no longer used for `table_hash`.
+
 This document is the single source of truth for how hyphasync computes
 fingerprints. Because changing any rule invalidates every stored hash, the v1
-rules below are **frozen**: changes require a new version tag (`v2`), not an
-edit in place.
+scalar rules are **frozen**. v2 extends them with nested-type support; further
+changes require a `v3` tag.
 
 ---
 
@@ -79,7 +83,7 @@ is for readability.
 | Integer (all widths, signed/unsigned) | `i` | decimal, no leading zeros, leading `-` if negative, `0` for zero |
 | DECIMAL / NUMERIC | `d` | sign + digits with a single `.`; **trailing fractional zeros stripped**; no exponent; canonical zero is `0` (e.g. `1.50`→`1.5`, `0.00`→`0`, `-0`→`0`) |
 | REAL / FLOAT / DOUBLE | `f` | shortest round-trippable decimal repr; special tokens `nan`, `inf`, `-inf`; `-0.0`→`0` |
-| VARCHAR / TEXT | `s` | UTF-8 bytes, **Unicode NFC** normalized |
+| VARCHAR / TEXT | `s` | UTF-8 bytes; length prefix is byte count via `strlen()` |
 | BLOB / BYTEA | `x` | lowercase hex |
 | DATE | `D` | `YYYY-MM-DD` |
 | TIME | `T` | `HH:MM:SS.ffffff` (microsecond precision, zero-padded) |
@@ -87,17 +91,26 @@ is for readability.
 | TIMESTAMPTZ | `z` | converted to **UTC**: `YYYY-MM-DDThh:mm:ss.ffffffZ` |
 | UUID | `u` | canonical lowercase `8-4-4-4-12` |
 | ENUM | `e` | the label text, NFC normalized |
-| LIST / ARRAY | `L` | length-prefixed concatenation of each element's field encoding, in list order |
-| STRUCT / ROW | `R` | for each field in declared order: `s(...)` of the field name, then the value's field encoding |
-| MAP | `M` | entries sorted ascending by the canonical encoding of the key; each entry = key field encoding then value field encoding |
+| LIST / ARRAY | `L` | DuckDB `::JSON::VARCHAR` serialization (JSON array), length-prefixed |
+| STRUCT / ROW | `R` | DuckDB `::JSON::VARCHAR` serialization (JSON object, fields in declaration order), length-prefixed |
+| MAP | `M` | DuckDB `::JSON::VARCHAR` serialization (JSON object; DuckDB sorts map keys in output), length-prefixed |
 
-### 4.3 Implementation note (initial cut)
+### 4.3 Implementation note
 
-The initial implementation MUST support all scalar types above. Nested types
-(`L`, `R`, `M`) are **reserved in the spec** but the first implementation MAY
-reject a column of a not-yet-supported type with an explicit
-`NotImplementedException` ("fingerprinting of type X is not implemented yet").
-It MUST NOT silently skip the column.
+Scalar types follow the canonical encoding above exactly.
+
+Nested types (`L`, `R`, `M`) use DuckDB's native `::JSON::VARCHAR` cast as the
+payload instead of the recursive sub-field encoding the spec describes.  This
+satisfies the **same-engine comparison guarantee** (§2) — both the "rows now"
+hash and the "rows we last pushed" hash are computed by the same DuckDB code
+path, so format differences never produce false positives.
+
+The spec's full recursive sub-field encoding (each element itself a tagged field)
+is reserved for a future **v3** if cross-version hash stability for nested types
+is required.
+
+An implementation MUST NOT silently skip a column of an unsupported type; it
+MUST throw `NotImplementedException` naming the column and type.
 
 ## 5. Row hash and row identity
 
@@ -169,6 +182,56 @@ Stored in `hypha.object_snapshot.definition_hash`.
   Stored in `hypha.object_snapshot.object_fingerprint`. This single value answers
   "did anything about this object change?" in one comparison.
 
+## 6.4 v3 fingerprint strategy classifier (current algorithm)
+
+The classifier picks one of three strategies for each table:
+
+### EXACT (estimated bytes < 1 MB)
+
+```sql
+table_hash = sha256(string_agg(sha256(each_row_encoding), chr(10) ORDER BY row_hash))
+```
+
+Full per-row sha256 using the canonical `FieldEncodingExpr` for every column (§4).
+Exact and deterministic. Applied when the estimated serialized table size is below the
+1 MB cost threshold: `estimated_bytes_per_row × row_count < 1,048,576 bytes`. This
+correctly promotes wide tables with few rows (e.g. 5k rows × 200 bytes/row ≈ 1 MB →
+EXACT) and demotes narrow tables with many rows (e.g. 200k rows × 11 bytes/row ≈ 2.2 MB
+→ not EXACT). The per-row byte estimate is computed from column type heuristics and does
+not require a full table scan.
+
+### APPEND_ONLY (has monotonic integer PK or timestamp ordering column)
+
+```sql
+table_hash = sha256(COUNT(*)::text || '|' || COALESCE(MAX(pk_col)::text, ''))
+```
+
+Detects inserts (the only mutation type for append-only tables) in O(1). Triggered
+when a column named `id`, `*_id`, `seq`, `*_seq`, `pk_*`, `created_at`, `*_at`,
+`*_ts`, etc. is found. Falls through to MUTABLE_ENTITY when no such column exists.
+
+### MUTABLE_ENTITY (default — all other tables)
+
+```sql
+table_hash = sha256(
+    COUNT(*)::text                    || '|' ||
+    COALESCE(MIN(rowid)::text, '')    || '|' ||
+    COALESCE(MAX(rowid)::text, '')
+)
+```
+
+DuckDB maintains zone-map metadata for the internal `rowid` pseudo-column.
+`COUNT(*)`, `MIN(rowid)`, and `MAX(rowid)` are typically answered directly from
+zone-map statistics — O(1), no full row scan.
+
+**Sensitivity:** Detects inserts (`COUNT` and `MAX(rowid)` increase), deletes
+(`COUNT`, `MIN`/`MAX(rowid)` change), and most updates (DuckDB moves updated rows
+to new rowid slots, changing `MAX(rowid)`).
+
+**Known limitation:** In-place updates that preserve rowid assignments (rare in
+DuckDB's current storage engine) may not be detected. The definition_hash still
+catches all schema changes regardless.
+
 ## 7. Comparison hierarchy (how sync uses these)
 
 From cheapest to most expensive — short-circuit at the first level that matches:
@@ -179,22 +242,56 @@ From cheapest to most expensive — short-circuit at the first level that matche
 4. else row-level diff: compare `(pk_json → row_hash)` maps to derive
    insert / update / delete sets.
 
-**Performance reality:** with no CDC, levels 3–4 still require a **full scan +
-hash of every row** to *compute* the current `table_hash`. `table_hash` lets us
-skip *applying* and skip the row-level diff, but not the scan. This is the
-inherent cost of the snapshot-diff model and should be communicated to users.
-(A future opt-in "watermark column" could bound the scan; out of scope for v1.)
+**Performance reality (v3):** MUTABLE_ENTITY and APPEND_ONLY `table_hash` values
+are computed in O(1) via DuckDB zone-map statistics — no full row scan. EXACT
+tables (estimated bytes < 1 MB) do a full per-row sha256, which is fast in practice
+given their small serialized size. Row-level diff (level 4) still requires reading
+`hypha.row_hash` entries captured during the snapshot plan, but those were captured
+at snapshot time and do not require re-scanning the source table on sync.
+
+*Historical note (v2):* The v2 algorithm required a full scan + per-row sha256 +
+sort to compute `table_hash` for all tables, which was O(n) and took >5 minutes on
+8.8 GB tables. v3 eliminates this bottleneck for large tables.
 
 ## 8. Versioning & required metadata
 
-The current schema has no place to record the algorithm version. v1 requires a
-small additive change (to be made when snapshotting is implemented):
+The `fingerprint_algo` column on `hypha.commit` records the algorithm version
+used for each snapshot.  On sync, if the stored `fingerprint_algo` ≠ the
+running code's version, hyphasync refuses to diff and forces a full re-snapshot,
+logging the reason to `hypha.event_log`.
 
-- Record `fingerprint_algo` (e.g. `'v1'`) with each captured snapshot — proposed
-  as a new column on `hypha.commit` (and mirrored in remote `hypha` metadata).
-- On sync, if the stored `fingerprint_algo` ≠ the running code's version, do
-  **not** diff: force a full re-snapshot and log the reason to
-  `hypha.event_log`.
+### Version history
+
+| Version | `HYPHA_FINGERPRINT_ALGO` | Description |
+|---------|--------------------------|-------------|
+| v1 | `v1` | Scalar types only. Nested types (LIST/STRUCT/MAP) throw `NotImplementedException`. |
+| v2 | `v2` | Adds nested type support (tags `L`, `R`, `M`) using DuckDB `::JSON::VARCHAR` as payload. All users with v1 snapshots must run `hypha_base_snapshot()` once to re-establish a v2 baseline before syncing. |
+| v3 | `v3` | Replaces the O(n) full-row sha256 scan with a fast rowid-statistics fingerprint (§6.4). All column type support from v2 is retained; only `table_hash` computation changes. All users with v2 snapshots must run `hypha_base_snapshot()` once to re-establish a v3 baseline. |
+
+### Migration from v2 to v3
+
+When `RunSync` detects a stored `fingerprint_algo = 'v2'` against running code
+`v3`, it raises:
+
+```
+fingerprint_algo mismatch: the last applied snapshot used 'v2' but the current
+code uses 'v3'. Run hypha_base_snapshot() to re-establish a baseline first.
+```
+
+Run `hypha_base_snapshot()` once; all subsequent syncs proceed normally with the
+faster v3 fingerprinting.
+
+### Migration from v1 to v2
+
+When `RunSync` detects a stored `fingerprint_algo = 'v1'` against running code
+`v2`, it raises:
+
+```
+fingerprint_algo mismatch: the last applied snapshot used 'v1' but the current
+code uses 'v2'. Run hypha_base_snapshot() to re-establish a baseline first.
+```
+
+Run `hypha_base_snapshot()` once; all subsequent syncs proceed normally.
 
 ## 9. Safety rules (no silent failures)
 
