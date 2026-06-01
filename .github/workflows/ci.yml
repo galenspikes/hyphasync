@@ -46,6 +46,9 @@ jobs:
       - name: Build
         run: CC=gcc CXX=g++ make release
 
+      - name: Install format tools
+        run: pip install "black>=24" clang_format==11.0.1 cmake-format
+
       - name: Format check
         run: make format-check
 

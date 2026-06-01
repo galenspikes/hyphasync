@@ -32,6 +32,8 @@ This is a C++ DuckDB extension (`hyphasync`). It builds via DuckDB's extension-c
 - **Docker daemon for integration test fallback**: The Docker Compose fallback requires the Docker daemon to be running. In Cloud Agent VMs: `sudo dockerd &>/tmp/dockerd.log &` then `sudo chmod 666 /var/run/docker.sock`.
 - **Format tools**: `make format-check` requires `pip install "black>=24" clang_format==11.0.1 cmake-format` and the `clang-format` system binary.
 - **Built DuckDB binary auto-loads the extension**: After `make release`, `./build/release/duckdb` has hyphasync linked in — no `LOAD` needed.
+- **Unsigned extension**: The built `.duckdb_extension` is not registry-signed. Any external DuckDB process that `LOAD`s it must allow unsigned extensions: `duckdb --unsigned` or `SET allow_unsigned_extensions=true;` in `~/.duckdbrc`. Without this, `LOAD` will fail. Load by full path — `LOAD hyphasync;` looks up the official registry and will not find it.
+- **`windows_amd64_mingw` requires a Meson patch for libpq**: The rtools42 MinGW toolchain ships `libpthread.a` (winpthreads), but PostgreSQL's Meson build unconditionally compiles `pthread-win32.c` into `libpq.a`, producing duplicate `pthread_mutex_lock` (and related) symbols at final link time. The fix is `vcpkg_ports/libpq/windows/mingw-pthread.patch`, which wraps the `pthread-win32.c` addition in `src/interfaces/libpq/meson.build` with `if cc.get_argument_syntax() == 'msvc'` so only MSVC/clang-cl get the shim; all MinGW toolchains (GCC, llvm-mingw clang) rely on `-lpthread` instead. If you upgrade the libpq port (bumping the PostgreSQL version), verify the Windows block at lines 22–27 of `src/interfaces/libpq/meson.build` still matches the patch context and update the patch if needed.
 
 ### Source structure
 
