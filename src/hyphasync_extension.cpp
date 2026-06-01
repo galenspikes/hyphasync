@@ -410,6 +410,15 @@ static void HyphaStatusFun(DataChunk &args, ExpressionState &state, Vector &resu
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Ensure the json extension is loaded for ::JSON casts on LIST/STRUCT/MAP columns used in
+	// fingerprinting and COPY. When json is statically bundled (extension_config.cmake), this
+	// is a no-op. For loadable-extension usage against an external DuckDB binary it covers the
+	// common case where json is installed but not yet activated in the host process.
+	{
+		Connection json_con(loader.GetDatabaseInstance());
+		json_con.Query("LOAD json");
+	}
+
 	ScalarFunction hypha_hello("hypha_hello", {}, LogicalType::VARCHAR, HyphaHelloFun);
 	loader.RegisterFunction(hypha_hello);
 

@@ -6,4 +6,6 @@ duckdb_extension_load(hyphasync
 )
 
 # Any extra extensions that should be built
-# e.g.: duckdb_extension_load(json)
+# json is required for ::JSON casts on LIST/STRUCT/MAP columns (fingerprinting + COPY).
+# Bundling it here ensures it is always available without a network download.
+duckdb_extension_load(json)
