@@ -12,7 +12,10 @@ if(PostgreSQL_FOUND AND NOT "@VCPKG_TARGET_IS_WINDOWS@")
 endif()
 if(PostgreSQL_FOUND AND "@VCPKG_LIBRARY_LINKAGE@" STREQUAL "static")
     include(SelectLibraryConfigurations)
-    foreach(LIB_ITEM pgport pgcommon)
+    # Order matters for single-pass linkers (GNU ld / MinGW): libpgcommon
+    # references symbols in libpgport (path.c, win32 port), so pgcommon must be
+    # listed before pgport, otherwise the references are dropped as undefined.
+    foreach(LIB_ITEM pgcommon pgport)
         find_library(PostgreSQL_${LIB_ITEM}_LIBRARY_RELEASE
             NAMES ${LIB_ITEM} lib${LIB_ITEM}
             NAMES_PER_DIR
