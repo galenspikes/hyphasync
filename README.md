@@ -48,10 +48,30 @@ Build:
 CC=gcc CXX=g++ make release
 ```
 
+> **Unsigned extension — `--unsigned` required for external DuckDB:** hyphasync is not in the DuckDB extension registry, so the built `.duckdb_extension` binary is unsigned. Any DuckDB process that tries to `LOAD` it must allow unsigned extensions, or the load will fail.
+>
+> ```sh
+> # Option A — pass the flag each time
+> duckdb --unsigned mydb.duckdb
+>
+> # Option B — add to ~/.duckdbrc (applies to every session automatically)
+> SET allow_unsigned_extensions=true;
+> ```
+>
+> Then load by **full path** (not `LOAD hyphasync;`, which looks up the official registry):
+>
+> ```sql
+> LOAD '/full/path/to/build/release/extension/hyphasync/hyphasync.duckdb_extension';
+> ```
+>
+> The repo-built `./build/release/duckdb` has the extension linked in and needs no `LOAD` at all.
+
 ### Full workflow
 
 ```sql
-LOAD hyphasync;
+-- Using the repo-built ./build/release/duckdb: extension is already linked in, no LOAD needed.
+-- Using your own DuckDB installation: start with `duckdb --unsigned` and then run:
+--   LOAD '/full/path/to/build/release/extension/hyphasync/hyphasync.duckdb_extension';
 
 -- Optional: install JSON extension for LIST/STRUCT/MAP column support
 INSTALL json; LOAD json;

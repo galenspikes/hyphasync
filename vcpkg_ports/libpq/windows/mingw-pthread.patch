@@ -2,7 +2,7 @@ diff --git a/src/interfaces/libpq/meson.build b/src/interfaces/libpq/meson.build
 index a74e885..c2b1e3f 100644
 --- a/src/interfaces/libpq/meson.build
 +++ b/src/interfaces/libpq/meson.build
-@@ -19,12 +19,17 @@
+@@ -19,12 +19,18 @@
  )
  libpq_so_sources = [] # for shared lib, in addition to the above
  
