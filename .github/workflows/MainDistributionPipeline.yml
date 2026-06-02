@@ -20,6 +20,7 @@ jobs:
       extension_name: hyphasync
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads
       reduced_ci_mode: disabled
+      vcpkg_version: "2024.12.16"
 
   code-quality-check:
     name: Code Quality Check
