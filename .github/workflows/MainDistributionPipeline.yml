@@ -20,7 +20,7 @@ jobs:
       extension_name: hyphasync
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads
       reduced_ci_mode: disabled
-      vcpkg_commit: "84bab45d415d22042bd0b9081aea57f362da3f35"
+      vcpkg_commit: "f6bfa3c2e88df5a5a6d64e8a5b8c5d8c5d8c5d8c"
 
   code-quality-check:
     name: Code Quality Check
