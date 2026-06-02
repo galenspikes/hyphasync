@@ -1,4 +1,4 @@
-# hyphasync fingerprinting & hashing — spec v1 / v2
+# hyphasync fingerprinting & hashing — spec v1 / v2 / v3
 
 Status: **v3 implemented**. The rules below are in production in
 `src/hypha_fingerprint.cpp`. All workflow functions (`hypha_base_snapshot_plan`,
