@@ -50,4 +50,12 @@ bool GetFastMode(Connection &con);
 //! Persist fast_mode into hypha.meta.
 void SetFastMode(Connection &con, bool fast_mode);
 
+//! Read exact_verify from hypha.meta (false when not set or not initialized).
+//! When true, fingerprinting forces the full per-row EXACT strategy for every table,
+//! closing the MUTABLE_ENTITY in-place-update blind spot at the cost of an O(n) scan.
+bool GetExactVerify(Connection &con);
+
+//! Persist exact_verify into hypha.meta.
+void SetExactVerify(Connection &con, bool exact_verify);
+
 } // namespace duckdb

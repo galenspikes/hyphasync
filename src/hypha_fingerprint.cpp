@@ -387,14 +387,41 @@ std::string BuildMutableEntitySQL(const std::string &schema, const std::string &
 
 } // namespace
 
+// Build the EXACT full-per-row sha256 table_hash SQL. Shared by the EXACT strategy, by
+// exact_verify mode (force_exact), and by hypha_verify(). Throws (via RowHashExpr) when a
+// column type is unsupported for hashing — callers fall back to a structural strategy.
+std::string BuildExactTableHashSQL(const std::string &schema_name, const std::string &table_name,
+                                   const std::vector<std::pair<std::string, std::string>> &cols) {
+	const auto rhe = RowHashExpr(cols);
+	return "SELECT sha256(string_agg(rh, chr(10) ORDER BY rh)) AS table_hash, "
+	       "COUNT(*) AS row_count FROM "
+	       "(SELECT " +
+	       rhe + " AS rh FROM " + QuoteIdent(schema_name) + "." + QuoteIdent(table_name) + ") __rows";
+}
+
 // ---------------------------------------------------------------------------
 // ClassifyTable(): assign a FingerprintStrategy to a specific table.
 // See docs/fingerprinting.md §6.4 for the full classification hierarchy.
 // ---------------------------------------------------------------------------
 
 FingerprintStrategy ClassifyTable(Connection &con, const std::string &schema_name, const std::string &table_name,
-                                  const std::vector<std::pair<std::string, std::string>> &cols, bool is_base_snapshot) {
+                                  const std::vector<std::pair<std::string, std::string>> &cols, bool is_base_snapshot,
+                                  bool force_exact) {
 	(void)is_base_snapshot; // classification is now identical for base and incremental snapshots
+
+	// exact_verify mode: force the full per-row EXACT hash for every table regardless of size.
+	// This closes the MUTABLE_ENTITY in-place-update blind spot (docs/fingerprinting.md §6.4) at
+	// the cost of an O(n) scan. Tables whose column types cannot be hashed fall through to the
+	// normal structural classification below rather than failing.
+	if (force_exact) {
+		try {
+			auto sql = BuildExactTableHashSQL(schema_name, table_name, cols);
+			return FingerprintStrategy {"EXACT", std::move(sql),
+			                            "exact_verify mode: forced full per-row hash (blind-spot-free)"};
+		} catch (...) {
+			// Unsupported column types — fall through to structural classification.
+		}
+	}
 
 	// ---- Structural classification ----
 
@@ -409,12 +436,8 @@ FingerprintStrategy ClassifyTable(Connection &con, const std::string &schema_nam
 
 	if (within_budget) {
 		try {
-			const auto rhe = RowHashExpr(cols);
-			const auto sql = "SELECT sha256(string_agg(rh, chr(10) ORDER BY rh)) AS table_hash, "
-			                 "COUNT(*) AS row_count FROM "
-			                 "(SELECT " +
-			                 rhe + " AS rh FROM " + QuoteIdent(schema_name) + "." + QuoteIdent(table_name) + ") __rows";
-			return FingerprintStrategy {"EXACT", sql,
+			auto sql = BuildExactTableHashSQL(schema_name, table_name, cols);
+			return FingerprintStrategy {"EXACT", std::move(sql),
 			                            "estimated ~" + std::to_string(quick_count * bytes_per_row) +
 			                                " bytes (<1 MB, " + std::to_string(quick_count) + " rows × " +
 			                                std::to_string(bytes_per_row) + " bytes/row), full per-row hash is cheap"};
@@ -472,7 +495,7 @@ FingerprintStrategy ClassifyTable(Connection &con, const std::string &schema_nam
 
 TableFingerprint ComputeTableFingerprint(Connection &con, const std::string &schema_name, const std::string &table_name,
                                          const std::vector<std::pair<std::string, std::string>> &cols,
-                                         bool is_base_snapshot) {
+                                         bool is_base_snapshot, bool force_exact) {
 	TableFingerprint fp;
 
 	if (cols.empty()) {
@@ -481,7 +504,7 @@ TableFingerprint ComputeTableFingerprint(Connection &con, const std::string &sch
 		return fp;
 	}
 
-	auto strategy = ClassifyTable(con, schema_name, table_name, cols, is_base_snapshot);
+	auto strategy = ClassifyTable(con, schema_name, table_name, cols, is_base_snapshot, force_exact);
 	fp.strategy_name = strategy.name;
 	fp.strategy_rationale = strategy.rationale;
 

@@ -47,10 +47,10 @@ SELECT hypha_doctor();
 
 ---
 
-## `hypha_init(conn VARCHAR [, max_rows BIGINT [, fast_mode BOOLEAN]])`
+## `hypha_init(conn VARCHAR [, max_rows BIGINT [, fast_mode BOOLEAN [, exact_verify BOOLEAN]]])`
 
 ```sql
--- 1-arg: safe defaults (no row limit, fast_mode=false)
+-- 1-arg: safe defaults (no row limit, fast_mode=false, exact_verify=false)
 SELECT hypha_init('postgresql://user:pass@host:5432/dbname');
 
 -- 2-arg: skip tables with more than N rows
@@ -58,6 +58,9 @@ SELECT hypha_init('postgresql://...', 500000);
 
 -- 3-arg: enable fast_mode (synchronous_commit=off) for faster pushes
 SELECT hypha_init('postgresql://...', 0, true);
+
+-- 4-arg: enable exact_verify (full per-row EXACT fingerprinting for every table)
+SELECT hypha_init('postgresql://...', 0, false, true);
 ```
 
 **Purpose:** Registers a Postgres target and initializes the local `hypha.*` metadata schema. Always verifies the connection is reachable before writing anything — a failed init leaves the DuckDB file completely unchanged.
@@ -69,6 +72,7 @@ SELECT hypha_init('postgresql://...', 0, true);
 | `conn` | `VARCHAR` | Yes | libpq connection string or URL. NULL and empty string throw. |
 | `max_rows` | `BIGINT` | No | If > 0, tables with more rows than this limit are skipped during snapshot. Default 0 (unlimited). |
 | `fast_mode` | `BOOLEAN` | No | If true, sets `synchronous_commit=off` on every Postgres connection. Faster but risks data loss on crash. Safe for read-replica use. Default false. |
+| `exact_verify` | `BOOLEAN` | No | If true, forces the full per-row `EXACT` fingerprint strategy for every table, closing the `MUTABLE_ENTITY` in-place-update blind spot at an O(n) scan cost per snapshot/sync. Default false. See `hypha_verify()` for an on-demand alternative. |
 
 **What it does:**
 1. Validates the connection string syntax
@@ -338,6 +342,40 @@ SELECT hypha_sync();
 
 ---
 
+## `hypha_verify()`
+
+```sql
+SELECT hypha_verify();
+```
+
+**Purpose:** On-demand reconciliation tripwire for the `MUTABLE_ENTITY` in-place-update blind spot (see [fingerprinting.md §6.4](fingerprinting.md)). The fast O(1) fingerprint strategies can miss an in-place update that preserves row count and rowid range, leaving Postgres silently stale after a `hypha_sync()`. `hypha_verify()` recomputes the full per-row `EXACT` hash of every local table and reports any table that changed in a way the fast fingerprint would not catch.
+
+**What it does:**
+1. Enumerates the same user tables as `hypha_base_snapshot_plan()`.
+2. For each table, computes the `EXACT` table_hash (full per-row SHA-256) now.
+3. Compares it to the baseline stored in `hypha.verify_state` from the previous `hypha_verify()` run.
+4. For a changed table, compares the current *fast* hash against the stored snapshot fast hash to classify the change.
+5. Advances the baseline to the current exact hash.
+
+**Per-table classification:**
+
+| Result | Meaning |
+|--------|---------|
+| `armed` | First observation — baseline established, nothing to compare yet |
+| unchanged | Exact hash matches the last verify; table is clean |
+| `PENDING` | Changed since last verify, and the fast fingerprint also changed — `hypha_sync()` will catch it |
+| `BLIND_SPOT_DRIFT` | Changed in-place but the fast fingerprint did **not** change — Postgres is stale; run `hypha_base_snapshot()` to reconcile |
+
+**Return value:** One-line summary, e.g. `verify: 12 checked · 1 drift · 0 pending · 2 armed · 0 skipped`. Per-table detail prints to stderr.
+
+**event_log codes:** `VERIFY_DRIFT` (warn), `VERIFY_PENDING` (info), `VERIFY_SKIP` (warn — unsupported column type), `VERIFY_SUMMARY`.
+
+**No Postgres connection required.** The O(n) exact scan per table is the explicit cost of verifying. Each run measures "in-place change since the last verify," so run it as part of your post-sync routine to keep the tripwire armed.
+
+**Relationship to `exact_verify` mode:** `hypha_verify()` lets the fast path stay fast and pays the exact cost only when you ask. If you would rather never miss a change in the first place, initialize with `exact_verify := true` (4th argument to `hypha_init`) so every snapshot and sync uses `EXACT` directly.
+
+---
+
 ## Local metadata tables
 
 All metadata lives in the `hypha` schema of the DuckDB file. Never write to these tables directly.
@@ -351,7 +389,8 @@ All metadata lives in the `hypha` schema of the DuckDB file. Never write to thes
 | `hypha.table_snapshot` | `hypha_base_snapshot_plan` | Per-table row counts and `table_hash` |
 | `hypha.row_hash` | `hypha_base_snapshot_plan` | Per-row `pk_json` + `row_hash` (PK tables only) |
 | `hypha.event_log` | all functions | Append-only observability; never throws |
-| `hypha.meta` | `hypha_init` | Version constants: `metadata_schema_version`, `fingerprint_algo`, `hyphasync_version` |
+| `hypha.verify_state` | `hypha_verify` | Per-table exact-hash baseline for the blind-spot tripwire |
+| `hypha.meta` | `hypha_init` | Config/version: `metadata_schema_version`, `fingerprint_algo`, `hyphasync_version`, `fast_mode`, `exact_verify` |
 
 ---
 

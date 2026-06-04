@@ -652,3 +652,31 @@ query I
 SELECT hypha_help('hypha_status') LIKE '%sync%';
 ----
 true
+
+# ---------------------------------------------------------------------------
+# MUTABLE_ENTITY blind-spot fix — exact_verify flag + hypha_verify() tripwire
+# ---------------------------------------------------------------------------
+
+# hypha_verify() before init — no metadata, so it returns a clear "not initialized"
+# message instead of crashing (no Postgres connection required).
+query I
+SELECT hypha_verify() LIKE '%not initialized%';
+----
+true
+
+# hypha_help entry exists for hypha_verify and explains the blind-spot drift check.
+query I
+SELECT hypha_help('hypha_verify') LIKE '%hypha_verify%';
+----
+true
+
+query I
+SELECT hypha_help('hypha_verify') LIKE '%BLIND_SPOT_DRIFT%';
+----
+true
+
+# hypha_init help now documents the exact_verify argument.
+query I
+SELECT hypha_help('hypha_init') LIKE '%exact_verify%';
+----
+true

@@ -51,4 +51,14 @@ std::string RunHyphaDrop(Connection &con, bool drop_meta = false);
 //! Returns a help message when no sync history exists.
 std::string RunHyphaStatus(Connection &con);
 
+//! Recomputes the full per-row EXACT table_hash for every local table and compares it
+//! against the tripwire baseline in hypha.verify_state, detecting in-place changes that the
+//! fast O(1) fingerprint strategies (MUTABLE_ENTITY/APPEND_ONLY) can miss. Classifies each
+//! changed table as BLIND_SPOT_DRIFT (the stored snapshot fingerprint would NOT catch it —
+//! Postgres is silently stale) or PENDING (a normal change hypha_sync() will catch). Advances
+//! the baseline so the next run measures change-since-this-run. Read-only against Postgres
+//! (no target connection required); the O(n) exact scan is the explicit cost of verifying.
+//! Returns a one-line summary; per-table detail is printed to stderr.
+std::string RunHyphaVerify(Connection &con);
+
 } // namespace duckdb

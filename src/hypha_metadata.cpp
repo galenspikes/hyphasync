@@ -126,6 +126,19 @@ CREATE TABLE IF NOT EXISTS hypha.meta (
 );
 )";
 
+// hypha_verify() tripwire baseline: the last exact (full per-row) table_hash seen by a
+// hypha_verify() run, per table. Lets a subsequent verify detect in-place changes that the
+// fast O(1) fingerprint strategies (MUTABLE_ENTITY/APPEND_ONLY) can miss.
+const char *CREATE_VERIFY_STATE_SQL = R"(
+CREATE TABLE IF NOT EXISTS hypha.verify_state (
+    schema_name VARCHAR,
+    object_name VARCHAR,
+    verify_hash VARCHAR,
+    verified_at TIMESTAMP DEFAULT current_timestamp,
+    PRIMARY KEY (schema_name, object_name)
+);
+)";
+
 } // namespace
 
 bool IsHyphaMetadataInitialized(Connection &con) {
@@ -153,6 +166,7 @@ void EnsureHyphaMetadata(Connection &con, const std::string &conn_string) {
 	Exec(con, CREATE_ROW_HASH_SQL, "CREATE TABLE hypha.row_hash");
 	Exec(con, CREATE_EVENT_LOG_SQL, "CREATE TABLE hypha.event_log");
 	Exec(con, CREATE_META_SQL, "CREATE TABLE hypha.meta");
+	Exec(con, CREATE_VERIFY_STATE_SQL, "CREATE TABLE hypha.verify_state");
 
 	// Read stored schema version for migration decisions.
 	int stored_version = 0;
@@ -363,6 +377,31 @@ void SetFastMode(Connection &con, bool fast_mode) {
 	const auto sql = StringUtil::Format("INSERT INTO hypha.meta (key, value) VALUES ('fast_mode', %s) "
 	                                    "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()",
 	                                    QuoteLiteral(fast_mode ? std::string("true") : std::string("false")));
+	con.Query(sql);
+}
+
+bool GetExactVerify(Connection &con) {
+	if (!IsHyphaMetadataInitialized(con)) {
+		return false;
+	}
+	auto result = con.Query("SELECT value FROM hypha.meta WHERE key = 'exact_verify'");
+	if (!result || result->HasError() || result->RowCount() == 0) {
+		return false;
+	}
+	const auto val = result->GetValue(0, 0);
+	if (val.IsNull()) {
+		return false;
+	}
+	return val.ToString() == "true";
+}
+
+void SetExactVerify(Connection &con, bool exact_verify) {
+	if (!IsHyphaMetadataInitialized(con)) {
+		return;
+	}
+	const auto sql = StringUtil::Format("INSERT INTO hypha.meta (key, value) VALUES ('exact_verify', %s) "
+	                                    "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()",
+	                                    QuoteLiteral(exact_verify ? std::string("true") : std::string("false")));
 	con.Query(sql);
 }
 

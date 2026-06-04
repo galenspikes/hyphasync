@@ -531,6 +531,61 @@ check "interruption: sync completed without error" \
     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE operation='sync' AND code='OK'"
 
 # ---------------------------------------------------------------------------
+# 13 — hypha_verify: blind-spot tripwire
+# ---------------------------------------------------------------------------
+section "13 — hypha_verify: blind-spot tripwire"
+
+# A dedicated table for the tripwire so it is independent of earlier sections.
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE verify_demo AS SELECT range AS n, ('v' || range)::VARCHAR AS label FROM range(100);
+SELECT * FROM hypha_base_snapshot();
+" > /dev/null
+
+# First verify arms the baseline and writes hypha.verify_state.
+check "verify: returns a one-line summary" \
+    "SELECT hypha_verify() LIKE 'verify:%'"
+check "verify: verify_state populated" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.verify_state WHERE object_name='verify_demo'"
+check "verify: VERIFY_SUMMARY logged to event_log" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='VERIFY_SUMMARY'"
+
+# With no intervening change, a re-run reports zero drift (single evaluation per call).
+check "verify: clean re-run reports 0 drift" \
+    "SELECT hypha_verify() LIKE '%0 drift%'"
+
+# A change the fast fingerprint DOES catch is flagged (PENDING, not silently clean).
+# NOTE: one hypha_verify() call per check — it advances the baseline each run.
+"$DUCKDB" "$DB_FILE" -c "UPDATE verify_demo SET label='changed' WHERE n=1;" > /dev/null
+check "verify: in-place change is flagged (not 0 drift · 0 pending)" \
+    "SELECT hypha_verify() NOT LIKE '%0 drift \xc2\xb7 0 pending%'"
+
+# ---------------------------------------------------------------------------
+# 14 — exact_verify mode forces the EXACT strategy
+# ---------------------------------------------------------------------------
+section "14 — exact_verify mode forces EXACT fingerprinting"
+
+DB_EXACT="${ROOT_DIR}/build/integration_test_exact.duckdb"
+rm -f "$DB_EXACT"
+
+# 50 000 rows × ~33 bytes ≈ 1.6 MB > 1 MB budget, and no id/timestamp column → this table
+# would normally classify as MUTABLE_ENTITY. exact_verify must override that to EXACT.
+"$DUCKDB" "$DB_EXACT" -c "
+SELECT hypha_init('${PG_URL}', 0, false, true);
+CREATE TABLE wide_blob AS SELECT range AS n, random()::VARCHAR AS payload FROM range(50000);
+SELECT hypha_base_snapshot_plan();
+" > /dev/null
+
+_orig_db="$DB_FILE"
+DB_FILE="$DB_EXACT"
+check "exact_verify: exact_verify flag persisted in hypha.meta" \
+    "SELECT value='true' FROM hypha.meta WHERE key='exact_verify'"
+check "exact_verify: EXACT_VERIFY event logged" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='EXACT_VERIFY'"
+check "exact_verify: large table classified EXACT (not MUTABLE_ENTITY)" \
+    "SELECT fingerprint_strategy='EXACT' FROM hypha.table_snapshot WHERE table_name='wide_blob'"
+DB_FILE="$_orig_db"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo

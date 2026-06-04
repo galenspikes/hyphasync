@@ -85,6 +85,16 @@ ORDER BY schema_name, table_name
 	int64_t n_mutable_entity = 0;
 	std::string last_schema;
 
+	// exact_verify mode forces the full per-row EXACT fingerprint for every table, closing the
+	// MUTABLE_ENTITY in-place-update blind spot (docs/fingerprinting.md §6.4) at O(n) scan cost.
+	const bool force_exact = GetExactVerify(con);
+	if (force_exact) {
+		LogEvent(con, "info", "base_snapshot_plan", "EXACT_VERIFY",
+		         "exact_verify mode active: every table is fingerprinted with the full per-row EXACT strategy", "");
+		Printer::Print(OutputStream::STREAM_STDERR,
+		               "[hyphasync] exact_verify mode: forcing full per-row hash for all tables");
+	}
+
 	// Per-schema sets for collision-safe table name truncation.
 	// Scoped per schema because tables in different schemas don't conflict in Postgres.
 	std::unordered_map<std::string, std::unordered_set<std::string>> schema_pg_name_sets;
@@ -219,7 +229,7 @@ ORDER BY column_index
 		const auto fp_t0 = std::chrono::steady_clock::now();
 
 		try {
-			const auto fp = ComputeTableFingerprint(con, schema_name, table_name, fp_cols, is_base_snapshot);
+			const auto fp = ComputeTableFingerprint(con, schema_name, table_name, fp_cols, is_base_snapshot, force_exact);
 			const auto fp_ms =
 			    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - fp_t0).count();
 			row_count = fp.row_count;

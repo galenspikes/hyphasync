@@ -17,6 +17,14 @@ std::string FieldEncodingExpr(const std::string &col_expr, const std::string &du
 //! Row hash = sha256( join_0x1F( field_encoding(col) for each col in order ) )
 std::string RowHashExpr(const std::vector<std::pair<std::string, std::string>> &cols);
 
+//! Builds the EXACT full-per-row sha256 table_hash SQL for one table.
+//! Returns SQL producing (table_hash VARCHAR, row_count BIGINT) — the same formula the
+//! EXACT strategy uses, exposed so exact_verify mode and hypha_verify() can force it for
+//! tables of any size. Throws NotImplementedException (via RowHashExpr) when a column type
+//! is unsupported for hashing (e.g. nested types without the json extension loaded).
+std::string BuildExactTableHashSQL(const std::string &schema_name, const std::string &table_name,
+                                   const std::vector<std::pair<std::string, std::string>> &cols);
+
 // ---------------------------------------------------------------------------
 // Pluggable fingerprint strategy (v3 two-layer classifier)
 //
@@ -51,9 +59,13 @@ struct FingerprintStrategy {
 //!
 //! is_base_snapshot is accepted for API compatibility but does not alter classification;
 //! EXACT and APPEND_ONLY are both O(1) or O(small) and are safe at snapshot time.
+//! When force_exact is true (exact_verify mode), every table is hashed with the full
+//! per-row EXACT strategy regardless of size, closing the MUTABLE_ENTITY in-place-update
+//! blind spot at the cost of an O(n) scan. Tables whose column types cannot be hashed
+//! fall back to normal classification.
 FingerprintStrategy ClassifyTable(Connection &con, const std::string &schema_name, const std::string &table_name,
                                   const std::vector<std::pair<std::string, std::string>> &cols,
-                                  bool is_base_snapshot = false);
+                                  bool is_base_snapshot = false, bool force_exact = false);
 
 //! Result of ComputeTableFingerprint: hash, row count, and the chosen strategy.
 struct TableFingerprint {
@@ -69,7 +81,7 @@ struct TableFingerprint {
 //! is_base_snapshot is accepted for API compatibility; classification is identical for both modes.
 TableFingerprint ComputeTableFingerprint(Connection &con, const std::string &schema_name, const std::string &table_name,
                                          const std::vector<std::pair<std::string, std::string>> &cols,
-                                         bool is_base_snapshot = false);
+                                         bool is_base_snapshot = false, bool force_exact = false);
 
 //! Computes the definition_hash for a table from its column_snapshot rows.
 //! definition_hash = sha256( join_0x1F( schema, object, type, col metadata... ) )
