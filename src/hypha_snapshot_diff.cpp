@@ -574,10 +574,9 @@ WHERE commit_id = %s AND schema_name = %s AND object_name = %s LIMIT 1
 // that risks duplicates, returns false so the caller does a full TRUNCATE+COPY.
 // ---------------------------------------------------------------------------
 
-bool ApplyKeylessAppendDiff(Connection &con, PGconn *pg, const std::string &schema_name,
-                            const std::string &table_name, const std::string &pg_schema, const std::string &pg_table,
-                            const std::string &old_commit_id, const std::string &new_commit_id,
-                            const std::vector<ColumnDef> &cols, RowDiff &diff_out) {
+bool ApplyKeylessAppendDiff(Connection &con, PGconn *pg, const std::string &schema_name, const std::string &table_name,
+                            const std::string &pg_schema, const std::string &pg_table, const std::string &old_commit_id,
+                            const std::string &new_commit_id, const std::vector<ColumnDef> &cols, RowDiff &diff_out) {
 	// Only keyless tables — keyed tables go through ApplyRowLevelDiff.
 	const auto pk_result =
 	    Exec(con,
@@ -607,24 +606,23 @@ bool ApplyKeylessAppendDiff(Connection &con, PGconn *pg, const std::string &sche
 		return false; // no old hashes (or empty old table) → simplest correct path is full re-copy
 	}
 
-	const std::string old_grp = StringUtil::Format("(SELECT row_hash, COUNT(*) AS n FROM hypha.row_hash "
-	                                               "WHERE commit_id=%s AND schema_name=%s AND table_name=%s "
-	                                               "GROUP BY row_hash)",
-	                                               QuoteLiteral(old_commit_id), QuoteLiteral(schema_name),
-	                                               QuoteLiteral(table_name));
-	const std::string new_grp = StringUtil::Format("(SELECT row_hash, COUNT(*) AS n FROM hypha.row_hash "
-	                                               "WHERE commit_id=%s AND schema_name=%s AND table_name=%s "
-	                                               "GROUP BY row_hash)",
-	                                               QuoteLiteral(new_commit_id), QuoteLiteral(schema_name),
-	                                               QuoteLiteral(table_name));
+	const std::string old_grp =
+	    StringUtil::Format("(SELECT row_hash, COUNT(*) AS n FROM hypha.row_hash "
+	                       "WHERE commit_id=%s AND schema_name=%s AND table_name=%s "
+	                       "GROUP BY row_hash)",
+	                       QuoteLiteral(old_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name));
+	const std::string new_grp =
+	    StringUtil::Format("(SELECT row_hash, COUNT(*) AS n FROM hypha.row_hash "
+	                       "WHERE commit_id=%s AND schema_name=%s AND table_name=%s "
+	                       "GROUP BY row_hash)",
+	                       QuoteLiteral(new_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name));
 
 	// Multiset subset check: if any hash occurs more in old than new, rows were removed or
 	// updated. We cannot reconstruct removed content, so fall back to TRUNCATE+COPY.
 	{
-		auto rem = con.Query(
-		    StringUtil::Format("SELECT EXISTS(SELECT 1 FROM %s o LEFT JOIN %s n USING(row_hash) "
-		                       "WHERE o.n > COALESCE(n.n, 0))",
-		                       old_grp, new_grp));
+		auto rem = con.Query(StringUtil::Format("SELECT EXISTS(SELECT 1 FROM %s o LEFT JOIN %s n USING(row_hash) "
+		                                        "WHERE o.n > COALESCE(n.n, 0))",
+		                                        old_grp, new_grp));
 		if (!rem || rem->HasError() || rem->RowCount() == 0 || rem->GetValue(0, 0).IsNull() ||
 		    rem->GetValue(0, 0).GetValue<bool>()) {
 			return false; // removal/update detected (or check failed) → fallback
@@ -651,9 +649,8 @@ bool ApplyKeylessAppendDiff(Connection &con, PGconn *pg, const std::string &sche
 		return false; // unhashable column types → fallback
 	}
 	const std::string where =
-	    row_hash_expr + " NOT IN (SELECT row_hash FROM hypha.row_hash WHERE commit_id=" +
-	    QuoteLiteral(old_commit_id) + " AND schema_name=" + QuoteLiteral(schema_name) +
-	    " AND table_name=" + QuoteLiteral(table_name) + ")";
+	    row_hash_expr + " NOT IN (SELECT row_hash FROM hypha.row_hash WHERE commit_id=" + QuoteLiteral(old_commit_id) +
+	    " AND schema_name=" + QuoteLiteral(schema_name) + " AND table_name=" + QuoteLiteral(table_name) + ")";
 
 	// Consistency guard: the live NOT-IN count must equal the multiset surplus. A mismatch means
 	// a recomputed hash disagrees with the stored one, or a duplicate row gained copies (which the

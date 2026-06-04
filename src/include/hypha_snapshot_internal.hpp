@@ -138,10 +138,9 @@ bool ApplyRowLevelDiff(Connection &con, PGconn *pg, const std::string &schema_na
 //! has a PK, lacks row hashes for either commit, has any removed/updated rows, or fails an
 //! internal consistency guard. On success diff_out.inserts is set. Never produces duplicates:
 //! a mismatch between the expected and actual insert counts forces the safe fallback.
-bool ApplyKeylessAppendDiff(Connection &con, PGconn *pg, const std::string &schema_name,
-                            const std::string &table_name, const std::string &pg_schema, const std::string &pg_table,
-                            const std::string &old_commit_id, const std::string &new_commit_id,
-                            const std::vector<ColumnDef> &cols, RowDiff &diff_out);
+bool ApplyKeylessAppendDiff(Connection &con, PGconn *pg, const std::string &schema_name, const std::string &table_name,
+                            const std::string &pg_schema, const std::string &pg_table, const std::string &old_commit_id,
+                            const std::string &new_commit_id, const std::vector<ColumnDef> &cols, RowDiff &diff_out);
 
 struct SyncTableResult {
 	std::string table_name;

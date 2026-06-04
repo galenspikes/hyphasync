@@ -550,9 +550,9 @@ ORDER BY ordinal_position)",
 							LogAll(con, pg_log, db_name, "info", "sync", "KEYLESS_APPEND",
 							       a.schema_name + "." + a.table_name + ": keyless append-only fast path, +" +
 							           std::to_string(krd.inserts) + " rows (no TRUNCATE)");
-							const double dur_ms = std::chrono::duration<double, std::milli>(
-							                          std::chrono::steady_clock::now() - table_t0)
-							                          .count();
+							const double dur_ms =
+							    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - table_t0)
+							        .count();
 							Printer::Print(OutputStream::STREAM_STDERR,
 							               "[hyphasync] + " + tbl_label + "  APPEND  +" + std::to_string(krd.inserts) +
 							                   (krd.inserts == 1 ? " row  " : " rows  ") + FormatDurMs(dur_ms));

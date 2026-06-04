@@ -67,7 +67,7 @@ jobs:
           ccache --show-stats
 
       - name: Install format tools
-        run: pip install "black>=24" clang_format==11.0.1 cmake-format
+        run: pip install black==26.5.1 clang_format==11.0.1 cmake-format==0.6.13
 
       - name: Format check
         run: make format-check
@@ -78,6 +78,69 @@ jobs:
       - name: Performance benchmark
         run: BINARY=./build/release/duckdb ./scripts/benchmark-fingerprint.sh 60
         continue-on-error: true
+
+      - name: Integration tests
+        run: ./test/integration/run.sh --no-build
+
+  build-and-test-macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install libpq, Postgres and ccache
+        run: brew install libpq postgresql@16 ccache
+
+      - name: Set up build environment
+        run: |
+          LIBPQ="$(brew --prefix libpq)"
+          echo "CMAKE_PREFIX_PATH=${LIBPQ}" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=${LIBPQ}/lib/pkgconfig" >> $GITHUB_ENV
+          # Route the from-source DuckDB build through ccache (same as the Linux job).
+          echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+          echo "CCACHE_DIR=${HOME}/.ccache" >> $GITHUB_ENV
+          # Expose the Postgres 16 client tools (psql, pg_ctl, createdb) on PATH.
+          echo "$(brew --prefix postgresql@16)/bin" >> $GITHUB_PATH
+          echo "DUCKDB_SHA=$(git rev-parse HEAD:duckdb)" >> $GITHUB_ENV
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-
+            ccache-${{ runner.os }}-duckdb-
+
+      - name: Start Postgres on port 54329
+        run: |
+          PGDATA="$(brew --prefix)/var/postgresql@16"
+          # brew's post-install usually runs initdb; create the cluster if not.
+          if [ ! -d "$PGDATA" ]; then
+            initdb -D "$PGDATA" --auth-local=trust --auth-host=trust
+          fi
+          pg_ctl -D "$PGDATA" -o "-p 54329" -l "$PGDATA/server.log" start
+          for _ in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 54329 && break; sleep 1; done
+          # Create the standard test role + database (idempotent).
+          createuser -p 54329 -s hypha || true
+          psql -p 54329 -d postgres -c "ALTER ROLE hypha WITH LOGIN PASSWORD 'hypha';"
+          createdb -p 54329 -O hypha hypha_test || true
+          psql "postgresql://hypha:hypha@127.0.0.1:54329/hypha_test" -c "SELECT version();"
+
+      - name: Build
+        run: |
+          ccache --max-size=2G --zero-stats
+          make release
+          ccache --show-stats
+
+      - name: SQL tests
+        run: make test
+
+      - name: Smoke test
+        run: ./scripts/smoke-test.sh
 
       - name: Integration tests
         run: ./test/integration/run.sh --no-build

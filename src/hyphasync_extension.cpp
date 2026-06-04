@@ -362,7 +362,8 @@ static void HyphaHelpFun(DataChunk &args, ExpressionState &state, Vector &result
 	    {"hypha_verify",
 	     "hypha_verify()  \xe2\x86\x92  VARCHAR  Exact full per-row reconciliation tripwire. Recomputes the EXACT hash "
 	     "of every table and reports tables changed in-place since the last verify, flagging BLIND_SPOT_DRIFT "
-	     "(a change the fast fingerprint would miss \xe2\x80\x94 Postgres is stale) vs PENDING (hypha_sync() will catch "
+	     "(a change the fast fingerprint would miss \xe2\x80\x94 Postgres is stale) vs PENDING (hypha_sync() will "
+	     "catch "
 	     "it). No Postgres connection required; O(n) scan per table."},
 	    {"hypha_help",
 	     "hypha_help([function_name])  \xe2\x86\x92  VARCHAR  List all functions or describe a specific function"},
