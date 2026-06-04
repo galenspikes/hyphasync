@@ -369,9 +369,9 @@ ORDER BY column_index
 	    "verify: %lld checked \xc2\xb7 %lld drift \xc2\xb7 %lld pending \xc2\xb7 %lld armed \xc2\xb7 %lld skipped",
 	    (long long)n_checked, (long long)n_drift, (long long)n_pending, (long long)n_armed, (long long)n_skipped);
 	LogEvent(con, n_drift > 0 ? "warn" : "info", "verify", "VERIFY_SUMMARY", summary,
-	         "{\"checked\":" + std::to_string(n_checked) + ",\"drift\":" + std::to_string(n_drift) + ",\"pending\":" +
-	             std::to_string(n_pending) + ",\"armed\":" + std::to_string(n_armed) + ",\"ok\":" +
-	             std::to_string(n_ok) + ",\"skipped\":" + std::to_string(n_skipped) + "}");
+	         "{\"checked\":" + std::to_string(n_checked) + ",\"drift\":" + std::to_string(n_drift) +
+	             ",\"pending\":" + std::to_string(n_pending) + ",\"armed\":" + std::to_string(n_armed) +
+	             ",\"ok\":" + std::to_string(n_ok) + ",\"skipped\":" + std::to_string(n_skipped) + "}");
 	Printer::Print(OutputStream::STREAM_STDERR, "[hyphasync] " + summary);
 	return summary;
 }

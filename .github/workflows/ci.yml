@@ -67,7 +67,7 @@ jobs:
           ccache --show-stats
 
       - name: Install format tools
-        run: pip install "black>=24" clang_format==11.0.1 cmake-format
+        run: pip install black==26.5.1 clang_format==11.0.1 cmake-format==0.6.13
 
       - name: Format check
         run: make format-check

@@ -231,7 +231,8 @@ ORDER BY column_index
 		const auto fp_t0 = std::chrono::steady_clock::now();
 
 		try {
-			const auto fp = ComputeTableFingerprint(con, schema_name, table_name, fp_cols, is_base_snapshot, force_exact);
+			const auto fp =
+			    ComputeTableFingerprint(con, schema_name, table_name, fp_cols, is_base_snapshot, force_exact);
 			const auto fp_ms =
 			    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - fp_t0).count();
 			row_count = fp.row_count;
