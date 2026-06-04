@@ -385,15 +385,16 @@ pg_check "sync: new table has data" \
 pg_check "sync: dropped table removed from Postgres" \
     "SELECT COUNT(*)::INT FROM information_schema.tables WHERE table_schema='integration_test_main' AND table_name='new_table'" "0"
 
-# 06e: no-PK table data change uses TRUNCATE+COPY (logged)
+# 06e: no-PK table insert-only change uses the keyless append-only fast path (logged).
+# (The TRUNCATE+COPY fallback for deletes/updates is covered in section 15.)
 "$DUCKDB" "$DB_FILE" -c "
 INSERT INTO no_pk_table VALUES (3,'c');
 SELECT * FROM hypha_sync();
 " > /dev/null
 pg_check "sync: no-PK table data synced" \
     "SELECT COUNT(*)::INT FROM integration_test_main.no_pk_table" "3"
-check "sync: no-PK TRUNCATE_COPY logged to event_log" \
-    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='TRUNCATE_COPY'"
+check "sync: no-PK insert-only uses KEYLESS_APPEND fast path" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='KEYLESS_APPEND'"
 check "sync: tables_truncate_copy reported in sync note" \
     "SELECT (SELECT commit_id FROM hypha.commit WHERE kind='sync' ORDER BY created_at DESC LIMIT 1) IS NOT NULL"
 
@@ -529,6 +530,99 @@ pg_check "interruption: 1000 changed rows synced" \
     "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.interrupt_test WHERE v = 'changed'" "1000"
 check "interruption: sync completed without error" \
     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE operation='sync' AND code='OK'"
+
+# ---------------------------------------------------------------------------
+# 13 — hypha_verify: blind-spot tripwire
+# ---------------------------------------------------------------------------
+section "13 — hypha_verify: blind-spot tripwire"
+
+# A dedicated table for the tripwire so it is independent of earlier sections.
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE verify_demo AS SELECT range AS n, ('v' || range)::VARCHAR AS label FROM range(100);
+SELECT * FROM hypha_base_snapshot();
+" > /dev/null
+
+# First verify arms the baseline and writes hypha.verify_state.
+check "verify: returns a one-line summary" \
+    "SELECT hypha_verify() LIKE 'verify:%'"
+check "verify: verify_state populated" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.verify_state WHERE object_name='verify_demo'"
+check "verify: VERIFY_SUMMARY logged to event_log" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='VERIFY_SUMMARY'"
+
+# With no intervening change, a re-run reports zero drift (single evaluation per call).
+check "verify: clean re-run reports 0 drift" \
+    "SELECT hypha_verify() LIKE '%0 drift%'"
+
+# A change the fast fingerprint DOES catch is flagged (PENDING, not silently clean).
+# NOTE: one hypha_verify() call per check — it advances the baseline each run.
+"$DUCKDB" "$DB_FILE" -c "UPDATE verify_demo SET label='changed' WHERE n=1;" > /dev/null
+check "verify: in-place change is flagged (not 0 drift · 0 pending)" \
+    "SELECT hypha_verify() NOT LIKE '%0 drift \xc2\xb7 0 pending%'"
+
+# ---------------------------------------------------------------------------
+# 14 — exact_verify mode forces the EXACT strategy
+# ---------------------------------------------------------------------------
+section "14 — exact_verify mode forces EXACT fingerprinting"
+
+DB_EXACT="${ROOT_DIR}/build/integration_test_exact.duckdb"
+rm -f "$DB_EXACT"
+
+# 50 000 rows × ~33 bytes ≈ 1.6 MB > 1 MB budget, and no id/timestamp column → this table
+# would normally classify as MUTABLE_ENTITY. exact_verify must override that to EXACT.
+"$DUCKDB" "$DB_EXACT" -c "
+SELECT hypha_init('${PG_URL}', 0, false, true);
+CREATE TABLE wide_blob AS SELECT range AS n, random()::VARCHAR AS payload FROM range(50000);
+SELECT hypha_base_snapshot_plan();
+" > /dev/null
+
+_orig_db="$DB_FILE"
+DB_FILE="$DB_EXACT"
+check "exact_verify: exact_verify flag persisted in hypha.meta" \
+    "SELECT value='true' FROM hypha.meta WHERE key='exact_verify'"
+check "exact_verify: EXACT_VERIFY event logged" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='EXACT_VERIFY'"
+check "exact_verify: large table classified EXACT (not MUTABLE_ENTITY)" \
+    "SELECT fingerprint_strategy='EXACT' FROM hypha.table_snapshot WHERE table_name='wide_blob'"
+DB_FILE="$_orig_db"
+
+# ---------------------------------------------------------------------------
+# 15 — keyless table: append-only fast path + delete/update fallback
+# ---------------------------------------------------------------------------
+section "15 — keyless table: append-only fast path"
+
+# A table with no PRIMARY KEY → keyless.
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE keyless_log AS SELECT range AS seqno, ('e' || range)::VARCHAR AS payload FROM range(100);
+SELECT * FROM hypha_base_snapshot();
+" > /dev/null
+pg_check "keyless: base snapshot pushes 100 rows" \
+    "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.keyless_log" "100"
+
+# Insert-only change → append-only fast path (KEYLESS_APPEND, no TRUNCATE, no duplicates).
+"$DUCKDB" "$DB_FILE" -c "
+INSERT INTO keyless_log SELECT range AS seqno, ('e' || range)::VARCHAR FROM range(100, 150);
+SELECT * FROM hypha_sync();
+" > /dev/null
+pg_check "keyless append: Postgres has exactly 150 rows (no duplicates)" \
+    "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.keyless_log" "150"
+check "keyless append: KEYLESS_APPEND logged for keyless_log" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='KEYLESS_APPEND' AND message LIKE '%keyless_log%'"
+check "keyless append: no TRUNCATE_COPY used for the insert-only change" \
+    "SELECT COUNT(*)::BIGINT = 0 FROM hypha.event_log WHERE code='TRUNCATE_COPY' AND message LIKE '%keyless_log%'"
+
+# Delete + update → must fall back to TRUNCATE+COPY and reach the correct full state.
+"$DUCKDB" "$DB_FILE" -c "
+DELETE FROM keyless_log WHERE seqno < 10;
+UPDATE keyless_log SET payload='changed' WHERE seqno = 50;
+SELECT * FROM hypha_sync();
+" > /dev/null
+pg_check "keyless fallback: 140 rows after deleting 10" \
+    "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.keyless_log" "140"
+pg_check "keyless fallback: update propagated via full re-copy" \
+    "SELECT payload FROM ${PG_SCHEMA}.keyless_log WHERE seqno=50" "changed"
+check "keyless fallback: TRUNCATE_COPY logged for keyless_log" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='TRUNCATE_COPY' AND message LIKE '%keyless_log%'"
 
 # ---------------------------------------------------------------------------
 # Summary

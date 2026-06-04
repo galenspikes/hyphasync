@@ -185,6 +185,32 @@ v3 uses a cost-based strategy classifier per table:
 
 If you have a baseline from an older algorithm version, run `hypha_base_snapshot()` once to re-establish a v3 baseline. `hypha_sync()` refuses to diff across algorithm versions and tells you exactly what to do.
 
+### Verifying against the blind spot
+
+The O(1) `MUTABLE_ENTITY` strategy has a documented blind spot: an in-place update that leaves `COUNT(*)`, `MIN(rowid)`, and `MAX(rowid)` unchanged is not detected, so `hypha_sync()` would skip the table and leave Postgres silently stale. Two opt-in tools close this gap:
+
+**1. `exact_verify` mode — guaranteed-correct, slower.** Force full per-row SHA-256 hashing for every table regardless of size:
+
+```sql
+SELECT hypha_init('postgresql://...', 0, false, true);  -- 4th arg = exact_verify
+```
+
+Every `hypha_base_snapshot_plan()` / `hypha_sync()` now classifies all tables as `EXACT`. No table ever uses rowid statistics, so no change is ever missed — at the cost of an O(n) scan + hash per table. Use this when correctness matters more than throughput.
+
+**2. `hypha_verify()` — an on-demand tripwire, fast path stays fast.** Leave fingerprinting on the default fast strategies, and periodically run:
+
+```sql
+SELECT hypha_verify();
+```
+
+It recomputes the EXACT hash of every table and compares it to a baseline stored in `hypha.verify_state`, classifying each changed table:
+
+- **`BLIND_SPOT_DRIFT`** — the table changed in-place but the fast fingerprint did **not** notice. Postgres is stale; run `hypha_base_snapshot()` to reconcile. Logged at `warn` to `hypha.event_log` (code `VERIFY_DRIFT`).
+- **`PENDING`** — the table changed and the fast fingerprint **did** notice; a normal `hypha_sync()` will apply it.
+- **armed / unchanged** — first observation establishes the baseline; matching hashes are clean.
+
+Each run advances the baseline, so `hypha_verify()` measures "in-place change since the last verify." Run it as part of your post-sync routine to keep the tripwire armed. It needs no Postgres connection — the O(n) exact scan is the explicit cost of verifying.
+
 From R, prefer the repo CLI over loading the extension in CRAN `{duckdb}` — see [docs/r.md](docs/r.md).
 
 ## Type mapping
@@ -223,7 +249,8 @@ Postgres schemas are named `<duckdb_filename>_<duckdb_schema>`:
 |----------|-------------|
 | Single-column PK | Targeted DELETE + INSERT for changed rows only |
 | Composite PK | Same — compound key used for row identity |
-| No PK | TRUNCATE + COPY (correct, but full table; logged as `TRUNCATE_COPY` in event_log) |
+| No PK (insert-only change) | Append-only fast path — COPY just the new rows, no TRUNCATE (logged as `KEYLESS_APPEND`) |
+| No PK (any delete/update) | TRUNCATE + COPY (correct, but full table; logged as `TRUNCATE_COPY` in event_log) |
 
 ## Remote metadata on Postgres
 
@@ -245,14 +272,18 @@ Use `hypha_target_status()` to inspect `remote_hypha_sync_log` and `remote_hypha
 | `hypha_init(conn VARCHAR)` | `BOOLEAN` | Verify Postgres connectivity, create local `hypha` metadata |
 | `hypha_init(conn VARCHAR, max_rows BIGINT)` | `BOOLEAN` | Same; skip tables with row_count > max_rows |
 | `hypha_init(conn VARCHAR, max_rows BIGINT, fast_mode BOOLEAN)` | `BOOLEAN` | Same; fast_mode=true sets `synchronous_commit=off` (see note below) |
+| `hypha_init(conn VARCHAR, max_rows BIGINT, fast_mode BOOLEAN, exact_verify BOOLEAN)` | `BOOLEAN` | Same; exact_verify=true forces full per-row EXACT fingerprinting for every table (see note below) |
 | `hypha_target_status(conn VARCHAR)` | `VARCHAR` | Read-only Postgres probe (status=ok/degraded) |
 | `hypha_base_snapshot_plan()` | `VARCHAR` | Catalog walk + SHA-256 fingerprinting; no remote writes |
 | `SELECT * FROM hypha_base_snapshot()` | `TABLE(table_name VARCHAR, row_count BIGINT, fingerprint_strategy VARCHAR, duration_ms DOUBLE, status VARCHAR)` | Push all tables to Postgres via COPY; one row per table |
 | `hypha_sync_plan()` | `VARCHAR` | Fingerprint diff against last applied snapshot; no remote writes |
 | `SELECT * FROM hypha_sync()` | `TABLE(table_name VARCHAR, action VARCHAR, rows_synced BIGINT, duration_ms DOUBLE, status VARCHAR)` | Apply incremental sync; one row per changed table |
+| `hypha_verify()` | `VARCHAR` | Exact full per-row reconciliation tripwire; detects in-place changes the fast fingerprint can miss (see below) |
 | `hypha_help([name VARCHAR])` | `VARCHAR` | List all functions or describe a specific one |
 
 > **fast_mode note:** `fast_mode=true` sets `synchronous_commit=off` on every Postgres connection opened by hyphasync. This skips WAL flushing on commit, which can significantly speed up large base snapshots and syncs, but means committed data **can be lost on a Postgres crash** (the last few committed pages may not reach disk). This is safe when hyphasync is used purely as a read replica — a lost commit can be recovered by re-running `hypha_base_snapshot()`.
+
+> **exact_verify note:** `exact_verify=true` forces the full per-row `EXACT` fingerprint strategy for every table, closing the `MUTABLE_ENTITY` in-place-update blind spot (see [Verifying against the blind spot](#verifying-against-the-blind-spot)). It guarantees no change is ever missed, at the cost of an O(n) scan + SHA-256 per table on every snapshot and sync. Prefer leaving it off and running `hypha_verify()` periodically if you only need occasional reconciliation rather than always-exact fingerprints.
 
 See [docs/functions.md](docs/functions.md) for full reference: arguments, return value format, event_log codes, and use cases for each function.
 
@@ -269,12 +300,13 @@ Extension-owned schema: `hypha`
 | `hypha.table_snapshot` | Per-table row count and `table_hash` |
 | `hypha.row_hash` | Per-row PK+hash pairs for row-level diff |
 | `hypha.event_log` | All operations logged with level/code/message |
-| `hypha.meta` | Config: `metadata_schema_version`, `fingerprint_algo`, `hyphasync_version` |
+| `hypha.verify_state` | Per-table exact-hash baseline for the `hypha_verify()` tripwire |
+| `hypha.meta` | Config: `metadata_schema_version`, `fingerprint_algo`, `hyphasync_version`, `fast_mode`, `exact_verify` |
 
 ## Limitations & known issues
 
-- **In-place update blind spot for MUTABLE_ENTITY:** The `MUTABLE_ENTITY` fingerprint strategy (used for large tables) tracks row-ID statistics. An in-place update that replaces one value with a value of identical statistical signature (same min/max/count) will not be detected as a change.
-- **Keyless tables use TRUNCATE+COPY:** Tables without a primary key cannot use row-level diff (DELETE+INSERT). Every sync re-copies the full table. This is correct but potentially slow for large tables.
+- **In-place update blind spot for MUTABLE_ENTITY:** The `MUTABLE_ENTITY` fingerprint strategy (used for large tables) tracks row-ID statistics. An in-place update that replaces one value with a value of identical statistical signature (same min/max/count) will not be detected as a change. **Two opt-in mitigations:** (1) `hypha_init(conn, max_rows, fast_mode, exact_verify := true)` forces full per-row EXACT hashing for every table, eliminating the blind spot at an O(n) scan cost per snapshot/sync; (2) `hypha_verify()` is an on-demand tripwire that exact-hashes every table and reports any in-place drift the fast fingerprint would miss. See [Verifying against the blind spot](#verifying-against-the-blind-spot).
+- **Keyless tables — append-only fast path, else full re-copy:** Tables without a primary key cannot use targeted row-level diff (no key to DELETE/UPDATE by). When such a table only *gains* rows since the last sync, hyphasync takes an append-only fast path: it COPYs just the new rows (identified by content hash) with no TRUNCATE (`KEYLESS_APPEND`). When any row is deleted or updated — which can't be reconstructed and targeted without a key — it falls back to a correct full `TRUNCATE+COPY`. Unchanged keyless tables are skipped entirely via `table_hash`.
 - **`synchronous_commit=off` data-loss window:** When `fast_mode=true`, committed Postgres data may be lost if Postgres crashes before the WAL is flushed to disk. Safe only for read-replica use cases; recoverable by re-running `hypha_base_snapshot()`.
 - **OFFSET pagination cost for non-integer PKs:** Tables without a single-column integer PK use `LIMIT/OFFSET` for chunk pagination during COPY, which is O(n) in the offset depth. For very large tables with composite or non-integer PKs, the last chunks may be slow.
 - **Postgres 8 KB row limit for wide fixed-width tables:** Tables with many integer/numeric/date columns (hundreds of fixed-width columns) can exceed Postgres's 8 KB per-heap-row limit even after `SET STORAGE EXTERNAL` on varlena columns. Affected tables fail COPY with "row is too big" and are logged as `TABLE_FAIL` with the error message. Text-heavy tables are not affected (varlena columns are stored out-of-line via TOAST).

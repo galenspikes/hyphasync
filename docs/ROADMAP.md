@@ -3,7 +3,7 @@
 **Status: experimental.** The sync pipeline is implemented end-to-end, but we have not yet established acceptable quality on real workloads (large tables, wide schemas, long-running syncs, failure recovery). Release engineering and multi-client packaging come **after** that bar is met.
 
 **Last reviewed:** 2026-05-31  
-**Version:** `0.2.0` · **DuckDB build pin:** `v1.5.2` · **Fingerprint:** `v2`
+**Version:** `0.2.0` · **DuckDB build pin:** `v1.5.2` · **Fingerprint:** `v3`
 
 ---
 
@@ -31,7 +31,7 @@ Open questions we are still answering with real data:
 Experimental but complete as a **vertical slice**:
 
 - `hypha_init` → `hypha_base_snapshot_plan` → `hypha_base_snapshot` → `hypha_sync_plan` → `hypha_sync`
-- Fingerprinting v2, row-level diff (PK tables), schema evolution (ADD/DROP), nested types → jsonb
+- Fingerprinting v3 (rowid-statistics table_hash; v2 column encoding retained for row-level diff), row-level diff (PK tables), schema evolution (ADD/DROP), nested types → jsonb
 - Remote `hypha.sync_log` / `hypha.object_state` on Postgres
 - Test harness: `make test`, `./test/integration/run.sh`, `./scripts/test-sample-dbs.sh`
 
@@ -110,5 +110,5 @@ We bump DuckDB when we need a fix or when preparing a release — not on every u
 ## References
 
 - [docs/functions.md](functions.md) — SQL surface
-- [docs/fingerprinting.md](fingerprinting.md) — v2 spec
+- [docs/fingerprinting.md](fingerprinting.md) — v3 spec
 - [docs/upgrading-duckdb.md](upgrading-duckdb.md) — user upgrade guide (when relevant)

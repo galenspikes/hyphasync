@@ -1,4 +1,4 @@
-# hyphasync fingerprinting & hashing — spec v1 / v2
+# hyphasync fingerprinting & hashing — spec v1 / v2 / v3
 
 Status: **v3 implemented**. The rules below are in production in
 `src/hypha_fingerprint.cpp`. All workflow functions (`hypha_base_snapshot_plan`,
@@ -231,6 +231,19 @@ to new rowid slots, changing `MAX(rowid)`).
 **Known limitation:** In-place updates that preserve rowid assignments (rare in
 DuckDB's current storage engine) may not be detected. The definition_hash still
 catches all schema changes regardless.
+
+**Mitigations for the blind spot.** Two opt-in tools close this gap:
+
+- **`exact_verify` mode** — `hypha_init(conn, max_rows, fast_mode, exact_verify := true)`
+  forces the `EXACT` strategy (full per-row SHA-256) for *every* table regardless of
+  size, so no change is ever missed. Cost: O(n) scan + hash per table on each snapshot
+  and sync. `ClassifyTable(..., force_exact=true)` short-circuits to `EXACT` (falling back
+  to structural classification only when a column type cannot be hashed).
+- **`hypha_verify()`** — an on-demand tripwire that recomputes the `EXACT` table_hash for
+  every table and compares it to a baseline in `hypha.verify_state`. It reports
+  `VERIFY_DRIFT` (an in-place change the fast fingerprint would miss — Postgres is stale)
+  versus `VERIFY_PENDING` (a change `hypha_sync()` will catch), then advances the baseline.
+  Lets the fast path stay fast while still catching blind-spot drift on demand.
 
 ## 7. Comparison hierarchy (how sync uses these)
 

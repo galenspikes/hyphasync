@@ -34,17 +34,37 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install libpq and Postgres client
-        run: sudo apt-get update -qq && sudo apt-get install -y libpq-dev postgresql-client
+      - name: Install libpq, Postgres client and ccache
+        run: sudo apt-get update -qq && sudo apt-get install -y libpq-dev postgresql-client ccache
 
       - name: Set up build environment
         run: |
           MULTI=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo "x86_64-linux-gnu")
           echo "CMAKE_PREFIX_PATH=/usr" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=/usr/lib/${MULTI}/pkgconfig" >> $GITHUB_ENV
+          # Route the from-source DuckDB build through ccache. CMake initializes
+          # CMAKE_<LANG>_COMPILER_LAUNCHER from the environment variable of the
+          # same name, so this is picked up without touching the Makefile.
+          echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+          echo "CCACHE_DIR=${HOME}/.ccache" >> $GITHUB_ENV
+          # Pin to the DuckDB submodule SHA so the cache key changes on a bump.
+          echo "DUCKDB_SHA=$(git rev-parse HEAD:duckdb)" >> $GITHUB_ENV
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-
+            ccache-${{ runner.os }}-duckdb-
 
       - name: Build
-        run: CC=gcc CXX=g++ make release
+        run: |
+          ccache --max-size=2G --zero-stats
+          CC=gcc CXX=g++ make release
+          ccache --show-stats
 
       - name: Install format tools
         run: pip install "black>=24" clang_format==11.0.1 cmake-format

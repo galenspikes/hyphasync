@@ -132,6 +132,17 @@ bool ApplyRowLevelDiff(Connection &con, PGconn *pg, const std::string &schema_na
                        const std::string &pg_schema, const std::string &pg_table, const std::string &old_commit_id,
                        const std::string &new_commit_id, const std::vector<ColumnDef> &cols, RowDiff &diff_out);
 
+//! Append-only fast path for keyless (no-PK) tables. When the new row-hash multiset is a
+//! superset of the old (rows were only inserted), COPY just the new rows to Postgres with no
+//! TRUNCATE and no DELETE. Returns false — leaving the caller to TRUNCATE+COPY — when the table
+//! has a PK, lacks row hashes for either commit, has any removed/updated rows, or fails an
+//! internal consistency guard. On success diff_out.inserts is set. Never produces duplicates:
+//! a mismatch between the expected and actual insert counts forces the safe fallback.
+bool ApplyKeylessAppendDiff(Connection &con, PGconn *pg, const std::string &schema_name,
+                            const std::string &table_name, const std::string &pg_schema, const std::string &pg_table,
+                            const std::string &old_commit_id, const std::string &new_commit_id,
+                            const std::vector<ColumnDef> &cols, RowDiff &diff_out);
+
 struct SyncTableResult {
 	std::string table_name;
 	std::string action;

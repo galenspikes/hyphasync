@@ -102,6 +102,7 @@ static void HyphaInitFun(DataChunk &args, ExpressionState &state, Vector &result
 		// No explicit limit: reset to 0 (unlimited) so a prior limit doesn't persist.
 		SetMaxRowsPerTable(con, 0);
 		SetFastMode(con, false);
+		SetExactVerify(con, false);
 
 		const auto redacted = RedactConnString(conn_string);
 		const std::string details = "{\"target\":\"default\",\"database\":\"" + JsonEscape(probe.database) +
@@ -160,6 +161,7 @@ static void HyphaInitWithLimitFun(DataChunk &args, ExpressionState &state, Vecto
 		EnsureHyphaMetadata(con, conn_string);
 		SetMaxRowsPerTable(con, max_rows);
 		SetFastMode(con, false);
+		SetExactVerify(con, false);
 
 		const auto redacted = RedactConnString(conn_string);
 		const std::string details =
@@ -226,6 +228,7 @@ static void HyphaInitWithFastModeFun(DataChunk &args, ExpressionState &state, Ve
 		EnsureHyphaMetadata(con, conn_string);
 		SetMaxRowsPerTable(con, max_rows);
 		SetFastMode(con, fast_mode);
+		SetExactVerify(con, false);
 
 		const auto redacted = RedactConnString(conn_string);
 		const std::string details = "{\"target\":\"default\",\"database\":\"" + JsonEscape(probe.database) +
@@ -240,6 +243,94 @@ static void HyphaInitWithFastModeFun(DataChunk &args, ExpressionState &state, Ve
 	}
 }
 
+static void HyphaInitWithExactVerifyFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	Connection con(*context.db);
+
+	auto &input = args.data[0];
+	auto &limit_input = args.data[1];
+	auto &fast_mode_input = args.data[2];
+	auto &exact_input = args.data[3];
+	auto result_data = FlatVector::GetData<string_t>(result);
+
+	for (idx_t i = 0; i < args.size(); i++) {
+		const auto value = input.GetValue(i);
+		if (value.IsNull()) {
+			throw InvalidInputException("hypha_init requires a Postgres connection string, but received NULL. "
+			                            "Pass a URL like 'postgresql://user:pass@host:5432/dbname'.");
+		}
+		const auto conn_string = value.ToString();
+		if (conn_string.empty()) {
+			throw InvalidInputException("hypha_init requires a non-empty Postgres connection string. "
+			                            "Pass a URL like 'postgresql://user:pass@host:5432/dbname'.");
+		}
+
+		int64_t max_rows = 0;
+		{
+			const auto lv = limit_input.GetValue(i);
+			if (!lv.IsNull()) {
+				const int64_t raw = lv.GetValue<int64_t>();
+				max_rows = (raw > 0) ? raw : 0;
+			}
+		}
+
+		bool fast_mode = false;
+		{
+			const auto fv = fast_mode_input.GetValue(i);
+			if (!fv.IsNull()) {
+				fast_mode = fv.GetValue<bool>();
+			}
+		}
+
+		bool exact_verify = false;
+		{
+			const auto ev = exact_input.GetValue(i);
+			if (!ev.IsNull()) {
+				exact_verify = ev.GetValue<bool>();
+			}
+		}
+
+		const auto probe = ProbeHyphaConnection(conn_string);
+		if (!probe.connected) {
+			std::string detail = probe.error.empty() ? "could not connect to Postgres target" : probe.error;
+			if (!probe.error_code.empty()) {
+				detail += " (SQLSTATE " + probe.error_code + ")";
+			}
+			throw ConnectionException(
+			    "hypha_init could not connect to the Postgres target, so nothing was initialized: %s. "
+			    "Verify the connection string, that the server is reachable, and that credentials are correct.",
+			    detail);
+		}
+
+		EnsureHyphaMetadata(con, conn_string);
+		SetMaxRowsPerTable(con, max_rows);
+		SetFastMode(con, fast_mode);
+		SetExactVerify(con, exact_verify);
+
+		const auto redacted = RedactConnString(conn_string);
+		const std::string details = "{\"target\":\"default\",\"database\":\"" + JsonEscape(probe.database) +
+		                            "\",\"user\":\"" + JsonEscape(probe.user) +
+		                            "\",\"latency_ms\":" + std::to_string(probe.latency_ms) + ",\"conn\":\"" +
+		                            JsonEscape(redacted) + "\",\"max_rows_per_table\":" + std::to_string(max_rows) +
+		                            ",\"fast_mode\":" + (fast_mode ? "true" : "false") +
+		                            ",\"exact_verify\":" + (exact_verify ? "true" : "false") + "}";
+		LogEvent(con, "info", "init", "OK", "metadata initialized for target 'default'", details);
+
+		Printer::Print(OutputStream::STREAM_STDERR, BuildInitStatusLine(probe));
+		result_data[i] = StringVector::AddString(result, "");
+	}
+}
+
+static void HyphaVerifyFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	(void)args;
+	auto &context = state.GetContext();
+	Connection con(*context.db);
+	const auto report = RunHyphaVerify(con);
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto result_data = ConstantVector::GetData<string_t>(result);
+	result_data[0] = StringVector::AddString(result, report);
+}
+
 static void HyphaHelpFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	(void)state;
 
@@ -247,8 +338,9 @@ static void HyphaHelpFun(DataChunk &args, ExpressionState &state, Vector &result
 	static const char *HELP_TABLE[][2] = {
 	    {"hypha_hello", "hypha_hello()  →  VARCHAR  Confirm the extension is loaded (smoke test)"},
 	    {"hypha_doctor", "hypha_doctor()  →  VARCHAR  Diagnostic report: version, metadata status, capabilities"},
-	    {"hypha_init",
-	     "hypha_init(conn_string [, max_rows [, fast_mode]])  →  VARCHAR  Initialize hyphasync for a Postgres target"},
+	    {"hypha_init", "hypha_init(conn_string [, max_rows [, fast_mode [, exact_verify]]])  →  VARCHAR  Initialize "
+	                   "hyphasync for a Postgres target. exact_verify=true forces full per-row EXACT fingerprinting "
+	                   "(closes the MUTABLE_ENTITY in-place-update blind spot at O(n) scan cost)."},
 	    {"hypha_target_status",
 	     "hypha_target_status([conn_string])  →  VARCHAR  Read-only Postgres health probe; reports latency and remote "
 	     "metadata"},
@@ -267,6 +359,11 @@ static void HyphaHelpFun(DataChunk &args, ExpressionState &state, Vector &result
 	    {"hypha_status",
 	     "hypha_status()  \xe2\x86\x92  VARCHAR  Return a one-line summary of the last sync: commit_id, kind, "
 	     "timestamp, and table counts. Returns a help message if no sync has been run."},
+	    {"hypha_verify",
+	     "hypha_verify()  \xe2\x86\x92  VARCHAR  Exact full per-row reconciliation tripwire. Recomputes the EXACT hash "
+	     "of every table and reports tables changed in-place since the last verify, flagging BLIND_SPOT_DRIFT "
+	     "(a change the fast fingerprint would miss \xe2\x80\x94 Postgres is stale) vs PENDING (hypha_sync() will catch "
+	     "it). No Postgres connection required; O(n) scan per table."},
 	    {"hypha_help",
 	     "hypha_help([function_name])  \xe2\x86\x92  VARCHAR  List all functions or describe a specific function"},
 	    {nullptr, nullptr}};
@@ -426,10 +523,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	hypha_doctor.SetStability(FunctionStability::VOLATILE);
 	loader.RegisterFunction(hypha_doctor);
 
-	// hypha_init has three overloads:
-	//   hypha_init(conn_string)                              -- no row limit, fast_mode=false (default)
-	//   hypha_init(conn_string, max_rows_per_table)          -- skip tables with row_count > N
-	//   hypha_init(conn_string, max_rows_per_table, fast_mode) -- set fast_mode (synchronous_commit=off)
+	// hypha_init has four overloads:
+	//   hypha_init(conn_string)                                              -- no row limit, fast_mode=false
+	//   hypha_init(conn_string, max_rows_per_table)                          -- skip tables with row_count > N
+	//   hypha_init(conn_string, max_rows_per_table, fast_mode)               -- set fast_mode (synchronous_commit=off)
+	//   hypha_init(conn_string, max_rows_per_table, fast_mode, exact_verify) -- force full per-row EXACT hashing
 	ScalarFunctionSet hypha_init_set("hypha_init");
 
 	ScalarFunction hypha_init_1arg({LogicalType::VARCHAR}, LogicalType::VARCHAR, HyphaInitFun);
@@ -448,6 +546,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	hypha_init_3arg.SetStability(FunctionStability::VOLATILE);
 	hypha_init_3arg.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	hypha_init_set.AddFunction(hypha_init_3arg);
+
+	ScalarFunction hypha_init_4arg(
+	    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::BOOLEAN}, LogicalType::VARCHAR,
+	    HyphaInitWithExactVerifyFun);
+	hypha_init_4arg.SetStability(FunctionStability::VOLATILE);
+	hypha_init_4arg.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	hypha_init_set.AddFunction(hypha_init_4arg);
 
 	loader.RegisterFunction(hypha_init_set);
 
@@ -508,6 +613,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction hypha_status("hypha_status", {}, LogicalType::VARCHAR, HyphaStatusFun);
 	hypha_status.SetStability(FunctionStability::VOLATILE);
 	loader.RegisterFunction(hypha_status);
+
+	// hypha_verify() — exact full per-row reconciliation tripwire; detects in-place changes the
+	// fast O(1) fingerprint strategies can miss. No Postgres connection required.
+	ScalarFunction hypha_verify("hypha_verify", {}, LogicalType::VARCHAR, HyphaVerifyFun);
+	hypha_verify.SetStability(FunctionStability::VOLATILE);
+	loader.RegisterFunction(hypha_verify);
 
 	// hypha_help() — SQL-accessible function reference.
 	// hypha_help()           → all function descriptions
