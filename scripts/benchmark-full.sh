@@ -4,11 +4,13 @@
 # Outputs: console table + testdata/results/benchmark-<timestamp>.tsv
 set -euo pipefail
 
-ROOT_DIR="/Users/galenspikes/repos/hyphasync"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DUCKDB="${ROOT_DIR}/build/release/duckdb"
 TESTDATA="${ROOT_DIR}/testdata"
 RESULTS_DIR="${ROOT_DIR}/testdata/results"
 PG_URL="postgresql://hypha:hypha@127.0.0.1:54329/hypha_test"
+# Postgres superuser for initdb/admin (the OS user that owns the Homebrew cluster).
+PG_SUPERUSER="$(whoami)"
 PSQL="/opt/homebrew/opt/postgresql@16/bin/psql"
 INITDB="/opt/homebrew/opt/postgresql@16/bin/initdb"
 PG_DATADIR="/opt/homebrew/var/postgresql@16"
@@ -58,7 +60,7 @@ reinit_postgres() {
     log "Wiping datadir..."
     rm -rf "$PG_DATADIR"
     log "Running initdb..."
-    "$INITDB" -D "$PG_DATADIR" --username=galenspikes --auth=trust > /dev/null
+    "$INITDB" -D "$PG_DATADIR" --username="$PG_SUPERUSER" --auth=trust > /dev/null
     echo "port = 54329" >> "${PG_DATADIR}/postgresql.conf"
     log "Starting postgresql@16..."
     brew services start postgresql@16
@@ -71,11 +73,11 @@ reinit_postgres() {
     done
     sleep 1  # extra settle time
     log "Postgres up. Creating hypha user/db..."
-    psql -h 127.0.0.1 -p 54329 -U galenspikes postgres \
+    psql -h 127.0.0.1 -p 54329 -U "$PG_SUPERUSER" postgres \
         -c "CREATE USER hypha WITH PASSWORD 'hypha';" 2>/dev/null
-    psql -h 127.0.0.1 -p 54329 -U galenspikes postgres \
+    psql -h 127.0.0.1 -p 54329 -U "$PG_SUPERUSER" postgres \
         -c "CREATE DATABASE hypha_test OWNER hypha;" 2>/dev/null
-    psql -h 127.0.0.1 -p 54329 -U galenspikes hypha_test \
+    psql -h 127.0.0.1 -p 54329 -U "$PG_SUPERUSER" hypha_test \
         -c "GRANT ALL ON SCHEMA public TO hypha;" 2>/dev/null
     log "Postgres ready on port 54329."
 }

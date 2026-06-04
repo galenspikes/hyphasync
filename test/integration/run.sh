@@ -125,10 +125,8 @@ echo "Verifying native Postgres on port 54329..."
 }
 echo "Postgres OK ($("$PSQL" "$PG_URL" -tAc 'SELECT version()' | head -1))"
 
-# Redirect CSV staging to external drive when available
-if [[ -d /Volumes/alpha/tmp ]]; then
-    export TMPDIR=/Volumes/alpha/tmp
-fi
+# CSV staging uses the system temp dir. To stage on faster/larger storage, export
+# TMPDIR yourself before running this script.
 
 if [[ "${1:-}" != "--no-build" ]]; then
     echo "Building hyphasync extension..."

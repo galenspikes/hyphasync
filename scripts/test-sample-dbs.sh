@@ -69,11 +69,8 @@ echo "==> Verifying native PostgreSQL on port 54329..."
 }
 echo "    Postgres OK"
 
-# Redirect CSV staging to external drive when available (avoids filling internal disk)
-if [[ -d /Volumes/alpha/tmp ]]; then
-    export TMPDIR=/Volumes/alpha/tmp
-    echo "==> Staging TMPDIR → /Volumes/alpha/tmp (external, 639 GB free)"
-fi
+# CSV staging uses the system temp dir. To stage on faster/larger storage (and avoid
+# filling the internal disk), export TMPDIR yourself before running this script.
 
 # ── Collect DB files
 if [[ -n "$SINGLE_DB" ]]; then

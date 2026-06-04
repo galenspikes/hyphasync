@@ -79,7 +79,7 @@ See [docs/upgrading-duckdb.md](upgrading-duckdb.md) for what happens when *you* 
 | `hts-pipeline.duckdb` | `scripts/build-hts.sh` | HTS well/DR firehose |
 | Results | `testdata/results/*.jsonl` | Benchmark history |
 
-`testdata/` may symlink to external storage (e.g. `/Volumes/alpha/hyphasync-testdata`).
+`testdata/` is git-ignored; create it locally or symlink it to your own external storage.
 
 ---
 

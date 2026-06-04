@@ -7,7 +7,7 @@ testext
 test/python/__pycache__/
 .Rhistory
 .cache/
-# Sample databases for local testing (large binary files; not committed)
-testdata/*.db
-testdata/*.duckdb
-testdata/*.ddb
+# Sample databases / benchmark output for local testing (not committed).
+# Create testdata/ locally (the download scripts do this) or symlink it to your
+# own external storage — never commit the contents.
+/testdata/
