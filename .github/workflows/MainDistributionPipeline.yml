@@ -1,10 +1,26 @@
 #
-# Disabled for automatic runs — use Actions → "Main Extension Distribution Pipeline" → Run workflow
-# when you want a full distribution build or format/tidy on CI.
+# Manual extension distribution build. Actions -> "Main Extension Distribution Pipeline" -> Run workflow.
+# Builds the hyphasync extension binaries via DuckDB's official distribution workflow and uploads them
+# as downloadable run artifacts (named hyphasync-<duckdb_version>-extension-<arch>).
+#
+# Inputs let you scope a run without editing this file:
+#   exclude_archs     ';'-separated archs to skip. Default skips only wasm (builds all default platforms).
+#                     For a single linux_amd64 build, exclude every other default arch.
+#   run_code_quality  Also run the format/tidy code-quality check (off for a binary-only build).
 #
 name: Main Extension Distribution Pipeline
 on:
   workflow_dispatch:
+    inputs:
+      exclude_archs:
+        description: "';'-separated archs to exclude"
+        required: false
+        default: "wasm_mvp;wasm_eh;wasm_threads"
+      run_code_quality:
+        description: "Run the format/tidy code-quality check"
+        type: boolean
+        required: false
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
@@ -18,11 +34,12 @@ jobs:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5-variegata
       extension_name: hyphasync
-      exclude_archs: wasm_mvp;wasm_eh;wasm_threads
+      exclude_archs: ${{ inputs.exclude_archs }}
       reduced_ci_mode: disabled
 
   code-quality-check:
     name: Code Quality Check
+    if: ${{ inputs.run_code_quality }}
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
       duckdb_version: v1.5.2
