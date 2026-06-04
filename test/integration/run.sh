@@ -385,15 +385,16 @@ pg_check "sync: new table has data" \
 pg_check "sync: dropped table removed from Postgres" \
     "SELECT COUNT(*)::INT FROM information_schema.tables WHERE table_schema='integration_test_main' AND table_name='new_table'" "0"
 
-# 06e: no-PK table data change uses TRUNCATE+COPY (logged)
+# 06e: no-PK table insert-only change uses the keyless append-only fast path (logged).
+# (The TRUNCATE+COPY fallback for deletes/updates is covered in section 15.)
 "$DUCKDB" "$DB_FILE" -c "
 INSERT INTO no_pk_table VALUES (3,'c');
 SELECT * FROM hypha_sync();
 " > /dev/null
 pg_check "sync: no-PK table data synced" \
     "SELECT COUNT(*)::INT FROM integration_test_main.no_pk_table" "3"
-check "sync: no-PK TRUNCATE_COPY logged to event_log" \
-    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='TRUNCATE_COPY'"
+check "sync: no-PK insert-only uses KEYLESS_APPEND fast path" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='KEYLESS_APPEND'"
 check "sync: tables_truncate_copy reported in sync note" \
     "SELECT (SELECT commit_id FROM hypha.commit WHERE kind='sync' ORDER BY created_at DESC LIMIT 1) IS NOT NULL"
 
