@@ -18,14 +18,15 @@ This is a C++ DuckDB extension (`hyphasync`). It builds via DuckDB's extension-c
 
 ### Important caveats
 
-- **libpq required (Phase 1+)**: Install Postgres client libraries before building:
-  ```sh
-  brew install libpq
-  export CMAKE_PREFIX_PATH="$(brew --prefix libpq):${CMAKE_PREFIX_PATH:-}"
-  export PKG_CONFIG_PATH="$(brew --prefix libpq)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-  ```
-  CMake also checks `/opt/homebrew/opt/libpq` and `/usr/local/opt/libpq` automatically on macOS.
-- **Must use GCC**: The default compiler is Clang 18 which cannot find libstdc++ headers from gcc-13. Always set `CC=gcc CXX=g++` when building.
+- **libpq required**: Install the Postgres client library + development headers before building.
+  - **macOS**: `brew install libpq`, then expose it:
+    ```sh
+    export CMAKE_PREFIX_PATH="$(brew --prefix libpq):${CMAKE_PREFIX_PATH:-}"
+    export PKG_CONFIG_PATH="$(brew --prefix libpq)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    ```
+    CMake also checks `/opt/homebrew/opt/libpq` and `/usr/local/opt/libpq` automatically on macOS.
+  - **Linux (Debian/Ubuntu)**: `sudo apt-get update && sudo apt-get install -y libpq-dev` (the `apt-get update` matters — a stale package index can 404 on the pinned libpq-dev version).
+- **Compiler**: On **Linux**, set `CC=gcc CXX=g++` — the default Clang 18 cannot find the gcc-13 libstdc++ headers. On **macOS**, use the default Apple Clang (plain `make release`).
 - **Submodules required**: The `duckdb/` and `extension-ci-tools/` directories are git submodules. Run `git submodule update --init --recursive` if they are empty.
 - **First build is slow** (~10 minutes): DuckDB itself compiles from source. Subsequent incremental builds are fast.
 - **Integration tests prefer native Postgres**: `./test/integration/run.sh` checks for native Postgres 16 on port 54329 first. Set it up once with `./scripts/setup-postgres-test.sh`. Docker Compose is a fallback only — if no native Postgres is found on 54329, the script starts a container automatically.

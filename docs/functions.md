@@ -346,6 +346,23 @@ SELECT hypha_sync();
 
 ---
 
+## `hypha_status()`
+
+```sql
+SELECT hypha_status();
+-- last <kind> commit <id> at <timestamp> — N tables, M rows   (shape, not literal)
+```
+
+**Purpose:** Returns a one-line summary of the most recent snapshot or sync recorded in local metadata: commit id, kind (base snapshot vs sync), timestamp, and table/row counts. Reads only the local `hypha.*` metadata — **no Postgres connection required**.
+
+**Returns:** A single-line `VARCHAR`. If no snapshot or sync has been run yet, returns a short help message instead.
+
+**No side effects.** Safe to call at any time after `hypha_init()`.
+
+**Use case:** A quick "what happened last?" check in scripts or interactive sessions without paying for a Postgres round-trip.
+
+---
+
 ## `hypha_verify()`
 
 ```sql
@@ -453,6 +470,29 @@ SELECT * FROM hypha.object_state WHERE pg_schema = 'mydb_main' ORDER BY last_syn
 ```sql
 SELECT * FROM hypha_base_snapshot(); -- drops and recreates everything
 ```
+
+---
+
+## `hypha_drop([drop_meta BOOLEAN])`
+
+```sql
+SELECT hypha_drop();      -- drop the synced data schemas, keep hypha metadata
+SELECT hypha_drop(true);  -- also drop the remote `hypha` meta schema
+```
+
+**Purpose:** Drops every hyphasync-owned schema from the stored Postgres target — the `<dbname>_<duckschema>` data schemas created by `hypha_base_snapshot()`. Passing `true` additionally drops the remote `hypha` metadata schema (`hypha.sync_log`, `hypha.object_state`).
+
+**Arguments:**
+
+| Arg | Type | Default | Notes |
+|-----|------|---------|-------|
+| `drop_meta` | `BOOLEAN` | `false` | When `true`, also drop the remote `hypha` meta schema |
+
+**Returns:** A `VARCHAR` summary of how many schemas were dropped (with the connection string redacted).
+
+**Side effects:** Issues `DROP SCHEMA ... CASCADE` on the Postgres target. Destructive and irreversible on the remote side — the local DuckDB database is untouched.
+
+**Use case:** Reset a Postgres target to a clean state before re-running `hypha_base_snapshot()`, or clean up after testing.
 
 ---
 

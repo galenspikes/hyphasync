@@ -25,6 +25,16 @@ All workflow functions are implemented and end-to-end tested.
 | Real-time event_log mirroring to Postgres | ✅ dedicated autocommit connection |
 | CDC / WAL / streaming replication | non-goal |
 
+## Platform support
+
+| Platform | Status |
+|----------|--------|
+| Linux x86-64 | ✅ Supported — built, smoke-tested, and integration-tested in CI on every push |
+| macOS (Apple Silicon + Intel) | ✅ Supported — built and smoke-tested in CI on every push |
+| Windows | ⚠️ Experimental — builds, but sync is not yet functional (see below) |
+
+**Windows:** the extension compiles on Windows via the vcpkg libpq port, but the data-sync path is not yet functional there. `hypha_base_snapshot()` and `hypha_sync()` stream DuckDB's `COPY` output through a Unix `/dev/fd` file descriptor that does not exist on Windows, so sync fails at runtime. Windows is not yet covered by CI — use Linux or macOS for now.
+
 ## Quick start
 
 Clone with submodules:
@@ -34,7 +44,11 @@ git clone --recurse-submodules https://github.com/galenspikes/hyphasync.git
 cd hyphasync
 ```
 
-On macOS, install and expose libpq before building:
+### Prerequisites
+
+hyphasync links against **libpq** (the PostgreSQL client library) and compiles DuckDB from source, so you need a C++17 toolchain and libpq's development headers.
+
+**macOS** (Apple Silicon or Intel) — install and expose libpq:
 
 ```sh
 brew install libpq
@@ -42,11 +56,29 @@ export CMAKE_PREFIX_PATH="$(brew --prefix libpq):${CMAKE_PREFIX_PATH:-}"
 export PKG_CONFIG_PATH="$(brew --prefix libpq)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 ```
 
-Build:
+**Linux** (Debian/Ubuntu):
 
 ```sh
-CC=gcc CXX=g++ make release
+sudo apt-get update && sudo apt-get install -y libpq-dev
 ```
+
+**Linux** (Fedora/RHEL/CentOS):
+
+```sh
+sudo dnf install libpq-devel    # older distros: sudo yum install postgresql-devel
+```
+
+### Build
+
+```sh
+# Linux: force GCC. The default Clang cannot find the gcc libstdc++ headers.
+CC=gcc CXX=g++ make release
+
+# macOS: use the default Apple Clang toolchain.
+make release
+```
+
+The first build takes ~10 minutes (DuckDB compiles from source); incremental rebuilds are fast.
 
 > **Unsigned extension — `--unsigned` required for external DuckDB:** hyphasync is not in the DuckDB extension registry, so the built `.duckdb_extension` binary is unsigned. Any DuckDB process that tries to `LOAD` it must allow unsigned extensions, or the load will fail.
 >
@@ -112,7 +144,8 @@ SELECT * FROM hypha.commit ORDER BY created_at DESC;
 ## Building
 
 ```sh
-CC=gcc CXX=g++ make release
+CC=gcc CXX=g++ make release   # Linux
+make release                  # macOS (default Apple Clang toolchain)
 ```
 
 Artifacts:
@@ -122,6 +155,17 @@ Artifacts:
 - `./build/release/extension/hyphasync/hyphasync.duckdb_extension` — loadable binary
 
 Optional faster rebuilds: `GEN=ninja make` (with [ninja](https://ninja-build.org/) and [ccache](https://ccache.dev/) installed).
+
+## Smoke test
+
+The quickest "is it working?" check. It loads the extension, runs the diagnostics, and performs a real base snapshot + incremental sync against a live Postgres target:
+
+```sh
+./scripts/smoke-test.sh          # uses an existing ./build/release/duckdb
+./scripts/smoke-test.sh --build  # build first, then smoke test
+```
+
+It targets `postgresql://hypha:hypha@127.0.0.1:54329/hypha_test` by default (override with `HYPHA_PG_URL`) and, on Linux, starts the docker-compose Postgres service automatically if nothing is listening. The integration suite below is the thorough version.
 
 ## Running SQL tests
 
@@ -278,7 +322,9 @@ Use `hypha_target_status()` to inspect `remote_hypha_sync_log` and `remote_hypha
 | `SELECT * FROM hypha_base_snapshot()` | `TABLE(table_name VARCHAR, row_count BIGINT, fingerprint_strategy VARCHAR, duration_ms DOUBLE, status VARCHAR)` | Push all tables to Postgres via COPY; one row per table |
 | `hypha_sync_plan()` | `VARCHAR` | Fingerprint diff against last applied snapshot; no remote writes |
 | `SELECT * FROM hypha_sync()` | `TABLE(table_name VARCHAR, action VARCHAR, rows_synced BIGINT, duration_ms DOUBLE, status VARCHAR)` | Apply incremental sync; one row per changed table |
+| `hypha_status()` | `VARCHAR` | One-line summary of the last sync (commit, kind, timestamp, table counts); no Postgres connection required |
 | `hypha_verify()` | `VARCHAR` | Exact full per-row reconciliation tripwire; detects in-place changes the fast fingerprint can miss (see below) |
+| `hypha_drop([drop_meta BOOLEAN])` | `VARCHAR` | Drop all hyphasync-owned schemas from the stored Postgres target; `hypha_drop(true)` also drops the `hypha` meta schema |
 | `hypha_help([name VARCHAR])` | `VARCHAR` | List all functions or describe a specific one |
 
 > **fast_mode note:** `fast_mode=true` sets `synchronous_commit=off` on every Postgres connection opened by hyphasync. This skips WAL flushing on commit, which can significantly speed up large base snapshots and syncs, but means committed data **can be lost on a Postgres crash** (the last few committed pages may not reach disk). This is safe when hyphasync is used purely as a read replica — a lost commit can be recovered by re-running `hypha_base_snapshot()`.
