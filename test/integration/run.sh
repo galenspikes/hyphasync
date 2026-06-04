@@ -586,6 +586,44 @@ check "exact_verify: large table classified EXACT (not MUTABLE_ENTITY)" \
 DB_FILE="$_orig_db"
 
 # ---------------------------------------------------------------------------
+# 15 — keyless table: append-only fast path + delete/update fallback
+# ---------------------------------------------------------------------------
+section "15 — keyless table: append-only fast path"
+
+# A table with no PRIMARY KEY → keyless.
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE keyless_log AS SELECT range AS seqno, ('e' || range)::VARCHAR AS payload FROM range(100);
+SELECT * FROM hypha_base_snapshot();
+" > /dev/null
+pg_check "keyless: base snapshot pushes 100 rows" \
+    "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.keyless_log" "100"
+
+# Insert-only change → append-only fast path (KEYLESS_APPEND, no TRUNCATE, no duplicates).
+"$DUCKDB" "$DB_FILE" -c "
+INSERT INTO keyless_log SELECT range AS seqno, ('e' || range)::VARCHAR FROM range(100, 150);
+SELECT * FROM hypha_sync();
+" > /dev/null
+pg_check "keyless append: Postgres has exactly 150 rows (no duplicates)" \
+    "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.keyless_log" "150"
+check "keyless append: KEYLESS_APPEND logged for keyless_log" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='KEYLESS_APPEND' AND message LIKE '%keyless_log%'"
+check "keyless append: no TRUNCATE_COPY used for the insert-only change" \
+    "SELECT COUNT(*)::BIGINT = 0 FROM hypha.event_log WHERE code='TRUNCATE_COPY' AND message LIKE '%keyless_log%'"
+
+# Delete + update → must fall back to TRUNCATE+COPY and reach the correct full state.
+"$DUCKDB" "$DB_FILE" -c "
+DELETE FROM keyless_log WHERE seqno < 10;
+UPDATE keyless_log SET payload='changed' WHERE seqno = 50;
+SELECT * FROM hypha_sync();
+" > /dev/null
+pg_check "keyless fallback: 140 rows after deleting 10" \
+    "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.keyless_log" "140"
+pg_check "keyless fallback: update propagated via full re-copy" \
+    "SELECT payload FROM ${PG_SCHEMA}.keyless_log WHERE seqno=50" "changed"
+check "keyless fallback: TRUNCATE_COPY logged for keyless_log" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='TRUNCATE_COPY' AND message LIKE '%keyless_log%'"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo

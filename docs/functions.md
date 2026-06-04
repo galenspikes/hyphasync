@@ -310,7 +310,8 @@ SELECT hypha_sync();
      - Add-only or mixed add+drop → `ALTER TABLE ADD/DROP COLUMN` + `TRUNCATE` + `COPY`
    - `ROWS_CHANGED`:
      - PK table with row hashes → targeted `DELETE` + filtered `COPY INSERT` (only changed rows)
-     - No PK or missing row hashes → `TRUNCATE` + full `COPY` (logged as `TRUNCATE_COPY`)
+     - No PK, insert-only change → append-only fast path: filtered `COPY` of just the new rows, no `TRUNCATE` (logged as `KEYLESS_APPEND`)
+     - No PK with any delete/update, or missing row hashes → `TRUNCATE` + full `COPY` (logged as `TRUNCATE_COPY`)
 4. After commit: writes `hypha.sync_log` and `hypha.object_state` (best-effort)
 5. Records a `hypha.commit` with `kind='sync'`, `status='applied'`
 
@@ -330,8 +331,11 @@ SELECT hypha_sync();
 **event_log codes:**
 - `OK` — sync completed
 - `TABLE_SKIP` — individual table failed; check `hypha.event_log` for details
-- `TRUNCATE_COPY` — table had no PK or missing row hashes; TRUNCATE+COPY was used
+- `KEYLESS_APPEND` — no-PK table changed by inserts only; new rows COPYed without TRUNCATE
+- `TRUNCATE_COPY` — table had no PK (with deletes/updates) or missing row hashes; TRUNCATE+COPY was used
 - `REMOTE_META_FAIL` — bookkeeping write failed (sync data still applied)
+
+**Action values** (returned in the `action` column): `new`, `updated`, `appended` (keyless append-only fast path), `schema_changed`, `truncate_copy`, `dropped`.
 
 **Throws on:** no prior applied snapshot, fingerprint algorithm mismatch.
 

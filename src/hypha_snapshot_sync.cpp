@@ -530,6 +530,34 @@ ORDER BY ordinal_position)",
 							}
 							continue; // Skip the COPY block below — already applied
 						}
+
+						// Keyless append-only fast path: when a no-PK table only gained rows, COPY just
+						// the new rows (no TRUNCATE, no DELETE). Returns false for any removal/update or
+						// risk of duplicates, leaving the TRUNCATE+COPY fallback below.
+						RowDiff krd;
+						const bool used_keyless =
+						    ApplyKeylessAppendDiff(con, pg, a.schema_name, a.table_name, pg_schema, pg_table,
+						                           old_commit_id, new_commit_id, cols, krd);
+						if (used_keyless) {
+							if (!hypha_oid.empty()) {
+								StampHyphaTableComment(pg, pg_schema, pg_table, hypha_oid, db_name, a.schema_name,
+								                       a.table_name, new_commit_id);
+							}
+							tables_synced++;
+							rows_synced += krd.inserts;
+							LogAll(con, pg_log, db_name, "info", "sync", "KEYLESS_APPEND",
+							       a.schema_name + "." + a.table_name + ": keyless append-only fast path, +" +
+							           std::to_string(krd.inserts) + " rows (no TRUNCATE)");
+							const double dur_ms = std::chrono::duration<double, std::milli>(
+							                          std::chrono::steady_clock::now() - table_t0)
+							                          .count();
+							Printer::Print(OutputStream::STREAM_STDERR,
+							               "[hyphasync] + " + tbl_label + "  APPEND  +" + std::to_string(krd.inserts) +
+							                   (krd.inserts == 1 ? " row  " : " rows  ") + FormatDurMs(dur_ms));
+							results.push_back({tbl_label, "appended", krd.inserts, dur_ms, "ok"});
+							continue; // Skip the COPY block below — already applied
+						}
+
 						// Fall back to TRUNCATE+COPY (no PK or missing row hashes).
 						tbl_is_tc = true;
 						tables_truncate_copy++;
@@ -770,7 +798,8 @@ VALUES (%s, %s, 'default', 'sync',
 		for (const auto &r : results) {
 			if (r.action == "new") {
 				cnt_new++;
-			} else if (r.action == "updated" || r.action == "schema_changed" || r.action == "truncate_copy") {
+			} else if (r.action == "updated" || r.action == "schema_changed" || r.action == "truncate_copy" ||
+			           r.action == "appended") {
 				cnt_updated++;
 			} else if (r.action == "dropped") {
 				cnt_dropped++;

@@ -565,4 +565,137 @@ WHERE commit_id = %s AND schema_name = %s AND object_name = %s LIMIT 1
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// ApplyKeylessAppendDiff(): append-only fast path for no-PK tables.
+// When the new row-hash multiset is a superset of the old (rows were only inserted),
+// COPY just the new rows — no TRUNCATE, no DELETE. Any removal/update, or any condition
+// that risks duplicates, returns false so the caller does a full TRUNCATE+COPY.
+// ---------------------------------------------------------------------------
+
+bool ApplyKeylessAppendDiff(Connection &con, PGconn *pg, const std::string &schema_name,
+                            const std::string &table_name, const std::string &pg_schema, const std::string &pg_table,
+                            const std::string &old_commit_id, const std::string &new_commit_id,
+                            const std::vector<ColumnDef> &cols, RowDiff &diff_out) {
+	// Only keyless tables — keyed tables go through ApplyRowLevelDiff.
+	const auto pk_result =
+	    Exec(con,
+	         StringUtil::Format("SELECT COALESCE(pk_columns, '') FROM hypha.object_snapshot "
+	                            "WHERE commit_id = %s AND schema_name = %s AND object_name = %s LIMIT 1",
+	                            QuoteLiteral(new_commit_id), QuoteLiteral(schema_name), QuoteLiteral(table_name)),
+	         "keyless: get pk_columns");
+	if (pk_result->RowCount() > 0 && !pk_result->GetValue(0, 0).IsNull() &&
+	    !pk_result->GetValue(0, 0).ToString().empty()) {
+		return false; // table has a PK
+	}
+
+	// Count stored row hashes for both commits. A baseline taken before keyless row_hash was
+	// populated has none for the old commit → fall back.
+	auto count_hashes = [&](const std::string &commit) -> int64_t {
+		auto r = con.Query(StringUtil::Format(
+		    "SELECT COUNT(*)::BIGINT FROM hypha.row_hash WHERE commit_id=%s AND schema_name=%s AND table_name=%s",
+		    QuoteLiteral(commit), QuoteLiteral(schema_name), QuoteLiteral(table_name)));
+		if (!r || r->HasError() || r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+			return -1;
+		}
+		return r->GetValue(0, 0).GetValue<int64_t>();
+	};
+	const int64_t old_n = count_hashes(old_commit_id);
+	const int64_t new_n = count_hashes(new_commit_id);
+	if (old_n <= 0 || new_n < 0) {
+		return false; // no old hashes (or empty old table) → simplest correct path is full re-copy
+	}
+
+	const std::string old_grp = StringUtil::Format("(SELECT row_hash, COUNT(*) AS n FROM hypha.row_hash "
+	                                               "WHERE commit_id=%s AND schema_name=%s AND table_name=%s "
+	                                               "GROUP BY row_hash)",
+	                                               QuoteLiteral(old_commit_id), QuoteLiteral(schema_name),
+	                                               QuoteLiteral(table_name));
+	const std::string new_grp = StringUtil::Format("(SELECT row_hash, COUNT(*) AS n FROM hypha.row_hash "
+	                                               "WHERE commit_id=%s AND schema_name=%s AND table_name=%s "
+	                                               "GROUP BY row_hash)",
+	                                               QuoteLiteral(new_commit_id), QuoteLiteral(schema_name),
+	                                               QuoteLiteral(table_name));
+
+	// Multiset subset check: if any hash occurs more in old than new, rows were removed or
+	// updated. We cannot reconstruct removed content, so fall back to TRUNCATE+COPY.
+	{
+		auto rem = con.Query(
+		    StringUtil::Format("SELECT EXISTS(SELECT 1 FROM %s o LEFT JOIN %s n USING(row_hash) "
+		                       "WHERE o.n > COALESCE(n.n, 0))",
+		                       old_grp, new_grp));
+		if (!rem || rem->HasError() || rem->RowCount() == 0 || rem->GetValue(0, 0).IsNull() ||
+		    rem->GetValue(0, 0).GetValue<bool>()) {
+			return false; // removal/update detected (or check failed) → fallback
+		}
+	}
+
+	// No removals → new ⊇ old; the multiset surplus is the number of rows to insert.
+	const int64_t surplus_total = new_n - old_n;
+	if (surplus_total <= 0) {
+		diff_out.inserts = 0; // multisets identical — nothing to copy (defensive; unchanged tables
+		return true;          // do not reach this path)
+	}
+
+	// New-rows filter: live rows whose content hash is absent from the old snapshot.
+	std::vector<std::pair<std::string, std::string>> fp_cols;
+	fp_cols.reserve(cols.size());
+	for (const auto &cd : cols) {
+		fp_cols.emplace_back(cd.name, cd.duckdb_type);
+	}
+	std::string row_hash_expr;
+	try {
+		row_hash_expr = RowHashExpr(fp_cols);
+	} catch (...) {
+		return false; // unhashable column types → fallback
+	}
+	const std::string where =
+	    row_hash_expr + " NOT IN (SELECT row_hash FROM hypha.row_hash WHERE commit_id=" +
+	    QuoteLiteral(old_commit_id) + " AND schema_name=" + QuoteLiteral(schema_name) +
+	    " AND table_name=" + QuoteLiteral(table_name) + ")";
+
+	// Consistency guard: the live NOT-IN count must equal the multiset surplus. A mismatch means
+	// a recomputed hash disagrees with the stored one, or a duplicate row gained copies (which the
+	// NOT IN filter cannot express). Either way, fall back to avoid inserting duplicates or
+	// missing rows.
+	{
+		auto actual = con.Query("SELECT COUNT(*)::BIGINT FROM " + QuoteIdent(schema_name) + "." +
+		                        QuoteIdent(table_name) + " WHERE " + where);
+		if (!actual || actual->HasError() || actual->RowCount() == 0 || actual->GetValue(0, 0).IsNull() ||
+		    actual->GetValue(0, 0).GetValue<int64_t>() != surplus_total) {
+			return false;
+		}
+	}
+
+	// Stream just the new rows to Postgres — no TRUNCATE, no DELETE.
+	const std::string copy_sql =
+	    "COPY " + QuoteIdent(pg_schema) + "." + QuoteIdent(pg_table) + " FROM STDIN CSV NULL '\\N'";
+	PGresult *cr = PQexec(pg, copy_sql.c_str());
+	if (!cr || PQresultStatus(cr) != PGRES_COPY_IN) {
+		const auto err = cr ? TrimPQ(PQresultErrorMessage(cr)) : TrimPQ(PQerrorMessage(pg));
+		if (cr) {
+			PQclear(cr);
+		}
+		throw IOException("keyless append COPY IN failed: " + err);
+	}
+	PQclear(cr);
+
+	CopyChunkViaPipe(con, pg, BuildCopySelectList(schema_name, table_name, cols, where), "keyless append COPY");
+
+	if (PQputCopyEnd(pg, nullptr) != 1) {
+		throw IOException("keyless append PQputCopyEnd failed");
+	}
+	PGresult *done = PQgetResult(pg);
+	if (!done || PQresultStatus(done) != PGRES_COMMAND_OK) {
+		const auto err = done ? TrimPQ(PQresultErrorMessage(done)) : TrimPQ(PQerrorMessage(pg));
+		if (done) {
+			PQclear(done);
+		}
+		throw IOException("keyless append COPY failed: " + err);
+	}
+	PQclear(done);
+
+	diff_out.inserts = surplus_total;
+	return true;
+}
+
 } // namespace duckdb

@@ -327,34 +327,42 @@ VALUES (%s, %s, %s, %s, 'table', %s, %s, %s, %s, %s, %s)
 		                        QuoteLiteral(hypha_object_id), QuoteLiteral(pg_table_name)),
 		     "INSERT hypha.object_snapshot");
 
-		// 5e. Populate hypha.row_hash for tables with any PK (single or composite).
-		// No-PK tables fall back to TRUNCATE+COPY in sync.
-		// pk_json: chr(31)-separated PK values in sorted column order (e.g. "42" or "1\x1falice").
-		// This is a compact compound key — not JSON — so no parsing extension is needed.
-		if (hashes_ok && !pk_columns.empty()) {
-			// Parse and sort PK column names for determinism.
+		// 5e. Populate hypha.row_hash for every table that hashed successfully.
+		// Keyed tables store pk_json (a chr(31)-separated compound key in sorted column order,
+		// e.g. "42" or "1\x1falice") for targeted row-level diff. Keyless tables store NULL
+		// pk_json and are keyed by row_hash alone, enabling the append-only fast path in sync.
+		if (hashes_ok) {
+			const bool keyless = pk_columns.empty();
+
+			// Parse and sort PK column names for determinism (empty for keyless tables).
 			std::vector<std::string> pk_col_vec;
-			{
+			if (!keyless) {
 				std::string rem = pk_columns;
 				while (!rem.empty()) {
 					const auto c = rem.find(',');
 					pk_col_vec.push_back(c == std::string::npos ? rem : rem.substr(0, c));
 					rem = c == std::string::npos ? "" : rem.substr(c + 1);
 				}
+				std::sort(pk_col_vec.begin(), pk_col_vec.end());
 			}
-			std::sort(pk_col_vec.begin(), pk_col_vec.end());
 
-			// Build SQL expression: col1_cast || chr(31) || col2_cast || ...
-			std::string pk_json_expr = "CAST(" + QuoteIdent(pk_col_vec[0]) + " AS VARCHAR)";
-			for (size_t pki = 1; pki < pk_col_vec.size(); pki++) {
-				pk_json_expr += " || chr(31) || CAST(" + QuoteIdent(pk_col_vec[pki]) + " AS VARCHAR)";
+			// Build the pk_json expression: keyed → col1_cast || chr(31) || ...; keyless → NULL.
+			std::string pk_json_expr;
+			if (keyless) {
+				pk_json_expr = "NULL";
+			} else {
+				pk_json_expr = "CAST(" + QuoteIdent(pk_col_vec[0]) + " AS VARCHAR)";
+				for (size_t pki = 1; pki < pk_col_vec.size(); pki++) {
+					pk_json_expr += " || chr(31) || CAST(" + QuoteIdent(pk_col_vec[pki]) + " AS VARCHAR)";
+				}
 			}
 
 			const auto row_hash_expr = RowHashExpr(fp_cols);
 
-			// Detect single-integer PK for keyset pagination; fall back to LIMIT/OFFSET otherwise.
+			// Detect single-integer PK for keyset pagination; keyless tables and other PK shapes
+			// use LIMIT/OFFSET pagination instead.
 			std::string rh_int_pk;
-			if (pk_col_vec.size() == 1) {
+			if (!keyless && pk_col_vec.size() == 1) {
 				for (const auto &fc : fp_cols) {
 					if (fc.first == pk_col_vec[0] && IsIntegerDuckType(fc.second)) {
 						rh_int_pk = pk_col_vec[0];

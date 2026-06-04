@@ -229,7 +229,8 @@ Postgres schemas are named `<duckdb_filename>_<duckdb_schema>`:
 |----------|-------------|
 | Single-column PK | Targeted DELETE + INSERT for changed rows only |
 | Composite PK | Same — compound key used for row identity |
-| No PK | TRUNCATE + COPY (correct, but full table; logged as `TRUNCATE_COPY` in event_log) |
+| No PK (insert-only change) | Append-only fast path — COPY just the new rows, no TRUNCATE (logged as `KEYLESS_APPEND`) |
+| No PK (any delete/update) | TRUNCATE + COPY (correct, but full table; logged as `TRUNCATE_COPY` in event_log) |
 
 ## Remote metadata on Postgres
 
@@ -285,7 +286,7 @@ Extension-owned schema: `hypha`
 ## Limitations & known issues
 
 - **In-place update blind spot for MUTABLE_ENTITY:** The `MUTABLE_ENTITY` fingerprint strategy (used for large tables) tracks row-ID statistics. An in-place update that replaces one value with a value of identical statistical signature (same min/max/count) will not be detected as a change. **Two opt-in mitigations:** (1) `hypha_init(conn, max_rows, fast_mode, exact_verify := true)` forces full per-row EXACT hashing for every table, eliminating the blind spot at an O(n) scan cost per snapshot/sync; (2) `hypha_verify()` is an on-demand tripwire that exact-hashes every table and reports any in-place drift the fast fingerprint would miss. See [Verifying against the blind spot](#verifying-against-the-blind-spot).
-- **Keyless tables use TRUNCATE+COPY:** Tables without a primary key cannot use row-level diff (DELETE+INSERT). Every sync re-copies the full table. This is correct but potentially slow for large tables.
+- **Keyless tables — append-only fast path, else full re-copy:** Tables without a primary key cannot use targeted row-level diff (no key to DELETE/UPDATE by). When such a table only *gains* rows since the last sync, hyphasync takes an append-only fast path: it COPYs just the new rows (identified by content hash) with no TRUNCATE (`KEYLESS_APPEND`). When any row is deleted or updated — which can't be reconstructed and targeted without a key — it falls back to a correct full `TRUNCATE+COPY`. Unchanged keyless tables are skipped entirely via `table_hash`.
 - **`synchronous_commit=off` data-loss window:** When `fast_mode=true`, committed Postgres data may be lost if Postgres crashes before the WAL is flushed to disk. Safe only for read-replica use cases; recoverable by re-running `hypha_base_snapshot()`.
 - **OFFSET pagination cost for non-integer PKs:** Tables without a single-column integer PK use `LIMIT/OFFSET` for chunk pagination during COPY, which is O(n) in the offset depth. For very large tables with composite or non-integer PKs, the last chunks may be slow.
 - **Postgres 8 KB row limit for wide fixed-width tables:** Tables with many integer/numeric/date columns (hundreds of fixed-width columns) can exceed Postgres's 8 KB per-heap-row limit even after `SET STORAGE EXTERNAL` on varlena columns. Affected tables fail COPY with "row is too big" and are logged as `TABLE_FAIL` with the error message. Text-heavy tables are not affected (varlena columns are stored out-of-line via TOAST).
