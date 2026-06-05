@@ -94,20 +94,36 @@ is for readability.
 | LIST / ARRAY | `L` | DuckDB `::JSON::VARCHAR` serialization (JSON array), length-prefixed |
 | STRUCT / ROW | `R` | DuckDB `::JSON::VARCHAR` serialization (JSON object, fields in declaration order), length-prefixed |
 | MAP | `M` | DuckDB `::JSON::VARCHAR` serialization (JSON object; DuckDB sorts map keys in output), length-prefixed |
+| JSON | `J` | DuckDB `::JSON::VARCHAR` serialization (canonical JSON text), length-prefixed |
 
 ### 4.3 Implementation note
 
 Scalar types follow the canonical encoding above exactly.
 
-Nested types (`L`, `R`, `M`) use DuckDB's native `::JSON::VARCHAR` cast as the
-payload instead of the recursive sub-field encoding the spec describes.  This
-satisfies the **same-engine comparison guarantee** (§2) — both the "rows now"
-hash and the "rows we last pushed" hash are computed by the same DuckDB code
-path, so format differences never produce false positives.
+Nested/document types (`L`, `R`, `M`, `J`) use DuckDB's native `::JSON::VARCHAR`
+cast as the payload instead of the recursive sub-field encoding the spec
+describes.  This satisfies the **same-engine comparison guarantee** (§2) — both
+the "rows now" hash and the "rows we last pushed" hash are computed by the same
+DuckDB code path, so format differences never produce false positives.
+
+The `J` encoding is **byte-exact**: it hashes the engine's canonical JSON text
+without additional key-sort or whitespace normalization. Re-reading the same
+stored value is deterministic, so there are no in-engine false positives; the
+accepted tradeoff is that an upstream writer reformatting a JSON value
+(reordering keys, changing whitespace) registers as a change. A SQL `NULL`
+encodes as `n():`; a JSON `null` literal encodes as `J(4):null` — the two are
+kept distinct.
 
 The spec's full recursive sub-field encoding (each element itself a tagged field)
-is reserved for a future **v3** if cross-version hash stability for nested types
-is required.
+is reserved for a future major revision if cross-version hash stability for
+nested types is required.
+
+The JSON tag `J` was added **additively** within `v3`: it changes no existing
+tag's bytes, and JSON columns previously produced no row hash (they fell back to
+the `MUTABLE_ENTITY` strategy), so there is no prior `J` hash to invalidate. No
+algorithm-version bump is required — tables containing JSON columns re-fingerprint
+to `EXACT` on their next snapshot and self-heal, instead of forcing a full
+re-snapshot for every user.
 
 An implementation MUST NOT silently skip a column of an unsupported type; it
 MUST throw `NotImplementedException` naming the column and type.
@@ -279,7 +295,7 @@ logging the reason to `hypha.event_log`.
 |---------|--------------------------|-------------|
 | v1 | `v1` | Scalar types only. Nested types (LIST/STRUCT/MAP) throw `NotImplementedException`. |
 | v2 | `v2` | Adds nested type support (tags `L`, `R`, `M`) using DuckDB `::JSON::VARCHAR` as payload. All users with v1 snapshots must run `hypha_base_snapshot()` once to re-establish a v2 baseline before syncing. |
-| v3 | `v3` | Replaces the O(n) full-row sha256 scan with a fast rowid-statistics fingerprint (§6.4). All column type support from v2 is retained; only `table_hash` computation changes. All users with v2 snapshots must run `hypha_base_snapshot()` once to re-establish a v3 baseline. |
+| v3 | `v3` | Replaces the O(n) full-row sha256 scan with a fast rowid-statistics fingerprint (§6.4). All column type support from v2 is retained; only `table_hash` computation changes. All users with v2 snapshots must run `hypha_base_snapshot()` once to re-establish a v3 baseline. Later extended additively with the JSON tag `J` (first-class `JSON`-type fingerprinting) — no version bump, since the change is additive and JSON tables self-heal on next snapshot. |
 
 ### Migration from v2 to v3
 

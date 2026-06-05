@@ -282,7 +282,9 @@ int64_t EstimateCSVBytesPerRow(const std::vector<ColumnDef> &cols,
 			w = (it != varchar_widths.end()) ? it->second : 32;
 		} else if (t == "BLOB" || t == "BYTEA" || t == "BINARY") {
 			w = 128;
-		} else if (t == "STRUCT" || t == "LIST" || t == "MAP" || t == "JSON" || t == "UNION" ||
+		} else if (t == "JSON") {
+			w = 128;
+		} else if (t == "STRUCT" || t == "LIST" || t == "MAP" || t == "UNION" ||
 		           StringUtil::StartsWith(t, "STRUCT(") || StringUtil::StartsWith(t, "LIST(") ||
 		           StringUtil::StartsWith(t, "MAP(") || StringUtil::EndsWith(t, "[]")) {
 			w = 64;
