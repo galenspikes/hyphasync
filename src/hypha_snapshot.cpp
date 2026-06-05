@@ -18,9 +18,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
-#ifndef _WIN32
 #include <unistd.h>
-#endif
 #include <unordered_map>
 #include <unordered_set>
 

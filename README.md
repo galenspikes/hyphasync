@@ -1,6 +1,23 @@
 # hyphasync
 
-**hyphasync** is a DuckDB extension that syncs a local DuckDB database to an existing PostgreSQL database — schema-to-schema, DuckDB → Postgres only, using SHA-256 fingerprinted snapshot-diffs with no CDC or WAL required.
+**hyphasync** publishes a DuckDB database to PostgreSQL — and on every run after the first, it copies only what changed.
+
+It fingerprints each table with SHA-256 and pushes only the tables — and, where it can, only the rows — that differ from the last sync. No CDC, no WAL, no triggers, no replication slots: just a snapshot diff computed entirely inside DuckDB. It is one-directional (DuckDB → Postgres) and schema-to-schema — point it at an existing Postgres database and it mirrors your DuckDB tables into a dedicated schema there.
+
+## Why not just DuckDB's `postgres` extension?
+
+DuckDB can already `ATTACH` a Postgres database and write to it with `CREATE TABLE pg.t AS SELECT * FROM t`. That is the right tool for a **one-shot copy**. hyphasync is built for the **repeated** case — a DuckDB database you rebuild or update and re-publish to Postgres on a schedule:
+
+| | DuckDB `postgres` extension | hyphasync |
+|---|---|---|
+| One-time copy | ✅ ideal | ✅ works (`hypha_base_snapshot()`) |
+| Re-sync after changes | Re-copies the whole table | Copies only changed tables/rows via fingerprint diff |
+| Change detection | None — you decide what to re-copy | SHA-256 snapshot diff, automatic |
+| Schema evolution | Manual | ADD/DROP COLUMN applied automatically |
+| Bookkeeping / audit | None | `hypha.event_log`, commit history, remote `hypha.sync_log` |
+| Direction | Read & write, either way | DuckDB → Postgres only |
+
+If you copy once, use the built-in extension. If you publish the same DuckDB database to Postgres again and again, hyphasync exists to make every run after the first cheap.
 
 ## Current status
 
@@ -31,9 +48,9 @@ All workflow functions are implemented and end-to-end tested.
 |----------|--------|
 | Linux x86-64 | ✅ Supported — built, smoke-tested, and integration-tested in CI on every push |
 | macOS (Apple Silicon + Intel) | ✅ Supported — built and smoke-tested in CI on every push |
-| Windows | ⚠️ Experimental — builds, but sync is not yet functional (see below) |
+| Windows | ❌ Not supported |
 
-**Windows:** the extension compiles on Windows via the vcpkg libpq port, but the data-sync path is not yet functional there. `hypha_base_snapshot()` and `hypha_sync()` stream DuckDB's `COPY` output through a Unix `/dev/fd` file descriptor that does not exist on Windows, so sync fails at runtime. Windows is not yet covered by CI — use Linux or macOS for now.
+**Windows is not supported.** hyphasync streams DuckDB's `COPY` output to Postgres through a Unix pipe addressed via `/dev/fd`, which has no Windows equivalent, so the data-sync path cannot run there. Windows binaries are not built or distributed — use Linux or macOS.
 
 ## Quick start
 
@@ -367,7 +384,7 @@ Extension-owned schema: `hypha`
 
 ## Roadmap
 
-Experimental — quality and large-workload validation come before new features or release packaging. See [docs/ROADMAP.md](docs/ROADMAP.md).
+Experimental — quality and large-workload validation come before new features or release packaging. See [docs/STATUS.md](docs/STATUS.md).
 
 If you upgrade DuckDB later: [docs/upgrading-duckdb.md](docs/upgrading-duckdb.md). For day-to-day use, prefer the repo-built `./build/release/duckdb` CLI over loading the extension into CRAN `{duckdb}`.
 

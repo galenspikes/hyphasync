@@ -3,7 +3,7 @@
 Status: **v3 implemented**. The rules below are in production in
 `src/hypha_fingerprint.cpp`. All workflow functions (`hypha_base_snapshot_plan`,
 `hypha_base_snapshot`, `hypha_sync_plan`, `hypha_sync`) compute and use
-fingerprints. Tracked in [ROADMAP.md](ROADMAP.md).
+fingerprints. Tracked in [STATUS.md](STATUS.md).
 
 v3 replaces the O(n) full-row sha256 scan with a fast rowid-statistics fingerprint
 (see §6.4). v2 column type encoding (`FieldEncodingExpr`, `RowHashExpr`) is retained
