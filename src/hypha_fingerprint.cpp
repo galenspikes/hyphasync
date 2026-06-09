@@ -30,6 +30,17 @@ std::string Sha256HexViaSql(Connection &con, const std::string &binary_payload) 
 	return result->GetValue(0, 0).ToString();
 }
 
+//! Shared SQL emission for the nested/document tags (L, R, M, J).
+//! All four use DuckDB's ::JSON::VARCHAR serialization as a length-prefixed,
+//! NULL-guarded payload. Factored out so the four branches stay byte-identical.
+std::string NestedJsonEncoding(const std::string &col_expr, char tag) {
+	const auto jp = "CAST((" + col_expr + ")::JSON AS VARCHAR)";
+	return std::string("CASE WHEN (") + col_expr +
+	       ") IS NULL THEN 'n():'"
+	       " ELSE '" +
+	       tag + "(' || octet_length(CAST((" + jp + ") AS BLOB)) || '):' || (" + jp + ") END";
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -217,38 +228,38 @@ std::string FieldEncodingExpr(const std::string &col_expr, const std::string &du
 	}
 
 	// ---------------------------------------------------------------------------
-	// v2: Nested types — LIST, STRUCT/ROW, MAP (spec §4.2 tags L, R, M).
+	// v2: Nested/document types — LIST, STRUCT/ROW, MAP, JSON (spec §4.2 tags L, R, M, J).
 	// Payload: DuckDB's ::JSON::VARCHAR canonical serialization, which is
 	// deterministic within a DuckDB version and satisfies the same-engine
 	// comparison guarantee (spec §2).  A future v3 may implement the full
 	// recursive sub-field encoding from the spec.
+	//
+	// All four share an identical emission shape, so they route through the shared
+	// NestedJsonEncoding() helper to guarantee no copy-paste drift. NULL-guarded; the
+	// byte-length prefix uses octet_length(CAST(... AS BLOB)) so multibyte JSON text
+	// is counted in bytes.
 	// ---------------------------------------------------------------------------
 
 	// LIST / ARRAY: tag 'L', payload = JSON array string.
 	if (StringUtil::EndsWith(t, "[]") || StringUtil::StartsWith(t, "LIST(")) {
-		const auto jp = "CAST((" + col_expr + ")::JSON AS VARCHAR)";
-		return "CASE WHEN (" + col_expr +
-		       ") IS NULL THEN 'n():'"
-		       " ELSE 'L(' || octet_length(CAST((" +
-		       jp + ") AS BLOB)) || '):' || (" + jp + ") END";
+		return NestedJsonEncoding(col_expr, 'L');
 	}
 
 	// STRUCT / ROW: tag 'R', payload = JSON object string.
 	if (StringUtil::StartsWith(t, "STRUCT(") || StringUtil::StartsWith(t, "ROW(")) {
-		const auto jp = "CAST((" + col_expr + ")::JSON AS VARCHAR)";
-		return "CASE WHEN (" + col_expr +
-		       ") IS NULL THEN 'n():'"
-		       " ELSE 'R(' || octet_length(CAST((" +
-		       jp + ") AS BLOB)) || '):' || (" + jp + ") END";
+		return NestedJsonEncoding(col_expr, 'R');
 	}
 
 	// MAP: tag 'M', payload = JSON object string (DuckDB sorts map keys in JSON output).
 	if (StringUtil::StartsWith(t, "MAP(")) {
-		const auto jp = "CAST((" + col_expr + ")::JSON AS VARCHAR)";
-		return "CASE WHEN (" + col_expr +
-		       ") IS NULL THEN 'n():'"
-		       " ELSE 'M(' || octet_length(CAST((" +
-		       jp + ") AS BLOB)) || '):' || (" + jp + ") END";
+		return NestedJsonEncoding(col_expr, 'M');
+	}
+
+	// JSON: tag 'J', payload = canonical JSON text (::JSON cast is an identity on an
+	// already-JSON column but guarantees the engine's canonical rendering). A SQL NULL
+	// encodes as 'n():'; a JSON `null` literal encodes as 'J(4):null' — kept distinct.
+	if (t == "JSON") {
+		return NestedJsonEncoding(col_expr, 'J');
 	}
 
 	// Unsupported: throw rather than silently skip (spec §9).
@@ -351,6 +362,8 @@ int64_t EstimateBytesPerRow(const std::vector<std::pair<std::string, std::string
 		           StringUtil::StartsWith(t, "CHARACTER(")) {
 			w = 32;
 		} else if (t == "BLOB" || t == "BYTEA" || t == "BINARY" || t == "VARBINARY") {
+			w = 128;
+		} else if (t == "JSON") {
 			w = 128;
 		} else {
 			w = 64; // DECIMAL, NUMERIC, INTERVAL, BIT, ENUM, LIST, STRUCT, MAP, …

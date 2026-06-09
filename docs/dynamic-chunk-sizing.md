@@ -95,7 +95,7 @@ These are **CSV serialized** byte estimates (not in-memory sizes), because the o
 | `UUID` | 36 |
 | `VARCHAR` / `TEXT` | **32** (heuristic; overridable via `stats()`) |
 | `BLOB`, `BYTEA`, `VARBINARY` | **128** (hex-escaped in CSV) |
-| `JSON` | **128** |
+| `JSON` | **128** (implemented in both `EstimateBytesPerRow` and `EstimateCSVBytesPerRow`) |
 | `STRUCT(...)`, `ROW(...)`, `MAP(...)` | **64** (serialized as JSON) |
 | `LIST(...)` / `type[]` | **64** (serialized as JSON array) |
 | `BIT`, `BITSTRING` | 32 |

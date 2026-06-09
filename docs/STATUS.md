@@ -1,230 +1,155 @@
-# hyphasync — status & roadmap
+# hyphasync — current project status
 
-The single living status document for hyphasync. User-facing usage lives in the
-[README](../README.md) and [docs/functions.md](functions.md); this file is the
-engineering truth: what works, what is broken, and the path to a public release.
-
-**Last reviewed:** 2026-06-05
-**Version:** `0.2.0` · **DuckDB build pin:** `v1.5.2` · **Fingerprint:** `v3` · **Metadata schema:** `3`
-**Status:** experimental — the sync pipeline is complete end-to-end, but quality on
-large/real workloads is not yet proven and the extension is not yet released.
-
----
-
-## The wedge
-
-DuckDB's built-in `postgres` extension copies a table to Postgres in one shot. hyphasync
-exists for the **repeated** case: re-publishing a DuckDB database to Postgres on a schedule,
-copying only what changed since the last sync (SHA-256 snapshot diff, no CDC/WAL). Every
-roadmap decision below should make the *incremental diff* cheaper or safer; anything that
-doesn't is probably out of scope.
+**Date:** 2026-05-31  
+**Build pin:** DuckDB `v1.5.2` · Fingerprint algo `v3` · Metadata schema version `3`  
+**Test result:** `All tests passed (94 assertions in 1 test case)` — `make test`
 
 ---
 
 ## What works today (verified against the live build)
 
-Full vertical slice, experimental but complete:
+### Core workflow
 
-- Workflow: `hypha_init` → `hypha_base_snapshot_plan` → `hypha_base_snapshot` →
-  `hypha_sync_plan` → `hypha_sync`, plus `hypha_status`, `hypha_verify`, `hypha_drop`,
-  `hypha_doctor`, `hypha_target_status`, `hypha_help`.
-- Fingerprinting v3 — EXACT / APPEND_ONLY / MUTABLE_ENTITY strategy classifier; row-level
-  diff for single and composite PKs; append-only fast path and TRUNCATE+COPY fallback for
-  keyless tables.
-- Schema evolution (ADD/DROP COLUMN without DROP+CREATE), nested types (LIST/STRUCT/MAP →
-  `jsonb`), full scalar type mapping.
-- Streaming COPY via in-process `pipe()` + reader thread — no temp files.
-- Remote `hypha.sync_log` / `hypha.object_state` on Postgres; local `hypha.*` metadata
-  schema; `hypha.event_log` observability with real-time mirroring to Postgres.
-- `tables_failed` / `rows_failed` tracking with WARNING output.
+| Function | Behavior |
+|----------|----------|
+| `SELECT hypha_init(conn)` | Verifies Postgres connectivity via libpq, creates local `hypha` schema, logs `OK` to event_log, prints `[hyphasync] connected · host=… · db=… · user=… · Nms` to **stderr**. Returns empty string `""`. |
+| `SELECT hypha_init(conn, max_rows)` | Same, plus stores a per-table row-count guard. Tables with estimated row_count > max_rows are skipped with a `TABLE_SKIP` event log entry. |
+| `SELECT hypha_init(conn, max_rows, fast_mode)` | Same, plus when `fast_mode=true` sets `synchronous_commit=off` on every Postgres connection for faster COPY throughput. |
+| `SELECT hypha_base_snapshot_plan()` | Walks the local DuckDB catalog, classifies each table (EXACT/APPEND_ONLY/MUTABLE_ENTITY), computes fingerprints, populates `hypha.{object,column,table}_snapshot`. Prints 4 summary lines to **stderr**: database name + table/column/row counts, strategy breakdown (EXACT/APPEND_ONLY/MUTABLE_ENTITY counts), fingerprint algo + short commit id, and a no-write reminder. Returns empty string `""`. Per-table progress also printed to stderr. |
+| `SELECT * FROM hypha_base_snapshot()` | **Table function.** Streams one row per table as it is COPYed to Postgres. Columns: `(table_name, row_count, fingerprint_strategy, duration_ms, status)`. Per-table progress on stderr. |
+| `SELECT hypha_sync_plan()` | Diffs current local fingerprints against last applied snapshot. No Postgres writes. Prints an elegant summary to **stderr**: a header line with database name, changed/unchanged table counts, and the short base commit id; a counts breakdown (`new`, `dropped`, `schema changed`, `rows changed`); one indented line per changed table with aligned action label and row info (`old → new rows` or `N rows (content changed)`); and a trailing `run hypha_sync() to apply` prompt. When nothing has changed: a single `all N tables unchanged · nothing to sync` line. Returns empty string `""`. |
+| `SELECT * FROM hypha_sync()` | **Table function.** Applies the diff and yields one row per changed table: `(table_name, action, rows_synced, duration_ms, status)`. Action values: `new`, `updated`, `schema_changed`, `truncate_copy`, `dropped`. Unchanged tables are counted but not yielded (they appear in the summary log). |
+| `SELECT hypha_drop()` | Reads the stored default target, connects to Postgres, lists all non-system schemas (everything outside `{pg_catalog, information_schema, public, pg_toast, pg_temp_1, pg_internal}` and not matching `pg_%`), and drops each with `DROP SCHEMA IF EXISTS … CASCADE`. Safe to call twice (idempotent). `hypha_drop(true)` also drops the remote `hypha` bookkeeping schema. Returns `"dropped N schemas from postgresql://…"`. |
+| `SELECT hypha_status()` | Reads local DuckDB metadata (`hypha.commit`, `hypha.object_snapshot`). No Postgres connection required. Prints one line to **stderr**: `[hyphasync] status · last sync: YYYY-MM-DD HH:MM UTC · kind: <kind> · N tables · commit: <8-char-id>`. When no sync has been run: `[hyphasync] status · no sync history — run hypha_init() then hypha_base_snapshot() first`. Returns empty string `""` in both cases. |
 
-See the [README](../README.md) and [docs/functions.md](functions.md) for the full SQL
-surface, type-mapping table, and per-function semantics.
-
-### Test status
-
-- `make test` — unit tests, DuckDB-only (no Postgres). Last green at 94 assertions.
-- `./test/integration/run.sh` — 94 integration tests against Postgres 16 on port 54329
-  (native preferred, Docker Compose fallback). Last green 2026-05-31.
-- CI (`.github/workflows/ci.yml`) builds + runs both on every push, Linux x86-64 and macOS.
+**Calling `SELECT hypha_base_snapshot()` or `SELECT hypha_sync()` without `* FROM` throws a helpful error** redirecting to the table-function syntax. Both scalar shims and table functions coexist in the catalog.
 
 ---
 
-## Known issues & critical gaps
+### Fingerprinting (algorithm v3)
 
-Ordered by how much they threaten a public release. The top two are the focus of the
-correctness milestone below.
+All hashing runs in DuckDB only. Three strategies, selected per-table at snapshot-plan time:
 
-### 1. Silent table-skip on COPY failure (correctness — top priority)
+| Strategy | Trigger condition | Hash computation | Cost |
+|----------|-------------------|------------------|------|
+| **EXACT** | Estimated serialized bytes < 1 MB | `sha256(string_agg(sha256(each_row_encoding), chr(10) ORDER BY row_hash))` | O(n) — fast because table is small |
+| **APPEND_ONLY** | Table has a monotonic integer PK or timestamp-like column (`id`, `*_id`, `created_at`, `*_at`, `*_ts`, etc.) | `sha256(COUNT(*)::text \|\| '\|' \|\| COALESCE(MAX(pk)::text, ''))` | O(1) |
+| **MUTABLE_ENTITY** | Default (all other tables) | `sha256(COUNT(*)::text \|\| '\|' \|\| COALESCE(MIN(rowid)::text, '') \|\| '\|' \|\| COALESCE(MAX(rowid)::text, ''))` | O(1) via DuckDB zone-map statistics |
 
-When a table's COPY throws (Postgres error, type conversion failure, oversized row), the
-code rolls back that table's savepoint, logs `TABLE_FAIL` to `hypha.event_log`, and
-continues. The table then simply **does not exist** on Postgres, and the only signal is a
-log line. The benchmark run measured real fidelity loss from this: ferc714-xbrl landed
-~32% of rows and frankenstein ~74%, with tables silently missing. See
-[docs/benchmarks.md](benchmarks.md) §1.4.
-
-A sync tool that can silently leave the target incomplete is not releasable. The fix
-(post-COPY target verification + loud, non-silent failure) is the correctness milestone.
-
-### 2. MUTABLE_ENTITY in-place-update blind spot (correctness)
-
-The O(1) `MUTABLE_ENTITY` strategy hashes `COUNT(*) + MIN/MAX(rowid)`. An in-place update
-that leaves those identical is not detected, so `hypha_sync()` skips the table and Postgres
-goes silently stale. Mitigations exist but are **opt-in** (`exact_verify=true`, or periodic
-`hypha_verify()`), so the unsafe behavior is the default. The correctness milestone flips
-this to safe-by-default and makes the strategy mix visible on every run.
-
-### 3. Per-table transaction overhead dominates wide catalogs (performance)
-
-Each table costs ~6 synchronous Postgres round trips (BEGIN/DROP/CREATE/ALTER/COPY/COMMIT).
-Databases with hundreds of tables (ferc1: 255, ferc2: 292) spend most of their time on
-scaffolding, not COPY. Addressed by the performance milestone (inter-table parallelism).
-
-### 4. OFFSET pagination for non-integer PKs (performance)
-
-Tables without a single-column integer PK paginate with `LIMIT/OFFSET`, which is O(n) in
-offset depth. Keyset pagination already exists for integer PKs; extending it to composite
-keys is part of the performance milestone.
-
-### 5. Wide fixed-width tables can exceed Postgres's 8 KB row limit
-
-`SET STORAGE EXTERNAL` only helps varlena columns. Tables with hundreds of integer/numeric
-columns can fail COPY with "row is too big". hyphasync pre-warns (`TABLE_TOO_WIDE`) and logs
-the failure, but cannot fix it — the table must be split or columns widened to text/jsonb.
-
-### 6. Memory expansion on schema-heavy databases
-
-ferc1 used ~3.9 GB RSS for a 993 MB source (DuckDB buffer pool + growing
-`hypha.column_snapshot`). DuckDB's memory limit is uncapped by default. Not yet addressed.
-
-### 7. Plaintext credentials in the DuckDB file
-
-Connection strings (including passwords) are stored in `hypha.target` inside the DuckDB
-file. No env-var / `.pgpass` indirection yet. Worth closing before public release.
-
-### 8. Output goes to stderr; functions return `""`
-
-The rich summaries print to stderr while the scalar functions return empty strings, so
-anything scripting hyphasync (cron, Airflow) cannot consume the result programmatically.
-Addressed by the selective-sync / structured-output milestone.
+`MUTABLE_ENTITY` detects inserts, deletes, and most updates. Known blind spot: an in-place update that leaves `COUNT(*)`, `MIN(rowid)`, and `MAX(rowid)` identical will not be detected (rare in DuckDB's current storage engine).
 
 ---
 
-## Roadmap to public release
+### Type mapping
 
-Sequenced so each milestone unblocks the next. Nothing ships publicly before the
-correctness milestone is green.
+All standard scalar types are mapped. Notable entries:
 
-### M1 — Positioning & scope ✅ (this pass)
-
-Wedge-forward README, single living status doc (this file), Windows dropped (Linux + macOS
-only; `_WIN32` source paths and Windows build archs removed).
-
-### M2 — Correctness (the release gate)
-
-- **Post-COPY target verification:** assert Postgres `COUNT(*)` matches source per table;
-  re-fingerprint small tables on the PG side; emit a non-silent `TARGET_DRIFT` event and
-  fail loudly. Closes gap #1.
-- **Safe-by-default fingerprinting:** make `exact_verify` the default; require opt-in to the
-  O(1) fallible path; surface the strategy mix on every `hypha_sync()`. Closes gap #2.
-- **Differential test harness:** generate random tables (types, NULLs, unicode, edge
-  numerics, single/composite/no PK), sync, compare every row against Postgres, thousands of
-  seeds in CI.
-
-### M3 — Selective sync & structured output
-
-- Include/exclude table globs and column exclusion.
-- Machine-readable return from `hypha_sync()` / `hypha_sync_plan()` (JSON or a queryable
-  `hypha.last_sync`). Closes gap #8.
-
-### M4 — Performance (gated on M2 baselines)
-
-- Inter-table parallel COPY (worker pool; thread-safe `event_log`). Addresses gap #3.
-- Keyset pagination for composite/non-integer PKs. Addresses gap #4.
-
-### M5 — Release engineering
-
-- Re-enable `MainDistributionPipeline.yml`, extension signing, registry submission.
-- Semver + `CHANGELOG.md`, `CONTRIBUTING.md`, issue/PR templates, a 90-second quickstart.
-- CI matrix matching the supported-platform claim.
-
-Open questions still being answered with real data: how long a 1B-row table takes to
-fingerprint + COPY; where libpq/Postgres limits bite (row size, identifier length, memory);
-whether incremental sync is actually cheaper than re-push for typical change patterns.
+- `TIMESTAMP_S` / `TIMESTAMP_MS` / `TIMESTAMP_NS` → `timestamp without time zone` (logged as `TYPE_COERCE` event)
+- `LIST(T)` / `T[]` / `STRUCT(...)` / `MAP(...)` → `jsonb` (requires `json` extension loaded in DuckDB)
+- `JSON` → `jsonb` — first-class: exact per-row fingerprinting (tag `J`) and `::JSON`-cast COPY; requires `json` extension
+- `HUGEINT` → `numeric(39,0)`, `UBIGINT` → `numeric(20,0)`
+- Unsupported types → column excluded; logged as event; rest of table syncs normally
 
 ---
 
-## Non-goals
+### Schema and identity handling
 
-- No CDC, DuckDB WAL inspection, or logical transaction logs.
-- No streaming replication.
-- No Postgres → DuckDB sync (one direction only).
-- No multi-target or non-Postgres databases.
-- No Windows.
+- **SafeTruncateIdent:** Postgres identifier names are truncated to 63 bytes with a collision suffix (`_01`, `_02`, …). Name truncations are logged as `NAME_TRUNCATED` events.
+- **NOT NULL suppression in base snapshot DDL:** The `CREATE TABLE` on Postgres does not emit `NOT NULL` constraints (avoids COPY rejection on rows that have NULLs due to type coercion or excluded columns).
+- **Varlena TOAST (SET STORAGE EXTERNAL):** After `CREATE TABLE`, all varlena columns (`text`, `bytea`, `jsonb`, `varchar`, `char`, `bit varying`) receive `ALTER COLUMN … SET STORAGE EXTERNAL` to force out-of-line storage and sidestep Postgres's 8 KB per-heap-row limit for text-heavy tables.
 
 ---
 
-## Clients — conservative stance
+### Observability and error tracking
 
-**Supported path today:** the DuckDB binary built from this repo
-(`./build/release/duckdb`), with hyphasync linked in. Shell scripts and SQL files call that
-binary directly.
-
-**R / Python / other bindings:** query DuckDB files freely with `{duckdb}` / `duckdb` — that
-does not require hyphasync. Running *sync* from inside CRAN `{duckdb}` is not a supported
-workflow yet: extension binaries are tied to a specific DuckDB engine version, and CRAN
-updates on its own schedule. The planned R path is a conservative wrapper that shells out to
-the known-good CLI (`system2` / `processx`) rather than `LOAD`-ing a loose `.duckdb_extension`
-into whatever DuckDB version `{duckdb}` shipped. See [docs/r.md](r.md).
+- **`tables_failed` / `rows_failed`:** Tracked per sync/snapshot run. If any table fails, a `WARNING: N tables failed (M rows lost)` line is printed to stderr and recorded in `hypha.sync_log`.
+- **`TABLE_FAIL` events:** Every per-table failure is logged to `hypha.event_log` with the Postgres error message.
+- **`TABLE_SKIP` events:** Tables exceeding `max_rows_per_table` are logged and skipped cleanly.
+- **NOTICE suppression:** `SET client_min_messages = warning` is applied to Postgres connections to suppress noisy NOTICE output.
+- **Real-time event_log mirroring:** A dedicated autocommit Postgres connection (`pg_log`) writes events immediately, visible even if the main transaction rolls back later.
 
 ---
 
-## Build pins & maintainer notes
+### Local metadata schema (`hypha.*` in DuckDB)
 
-| Dependency | Pin |
-|------------|-----|
-| DuckDB | `v1.5.2` (submodule + CI) |
-| extension-ci-tools | `@v1.5-variegata` |
-| libpq | system / Homebrew (vcpkg port for distribution builds) |
-| Postgres (tests) | 16; native port 54329 (preferred), Docker Compose fallback |
-
-We bump DuckDB when we need a fix or when preparing a release — not on every upstream patch.
-DuckDB 2.0 (Fall 2026) is on the radar; no action until the correctness milestone is done.
-Submodule bump procedure: [docs/UPDATING.md](UPDATING.md). User-facing upgrade story:
-[docs/upgrading-duckdb.md](upgrading-duckdb.md).
-
-### Bump checklist
-
-- Submodule + extension-ci-tools + CI workflow version.
-- `make release`, `make test`, `./test/integration/run.sh`.
-- Sample-DB harness on large testdata.
-- Update pins in this file and [upgrading-duckdb.md](upgrading-duckdb.md).
+| Table | Contents |
+|-------|----------|
+| `hypha.target` | Stored Postgres connection string (default target) |
+| `hypha.commit` | Snapshot/sync commit history with `fingerprint_algo` |
+| `hypha.object_snapshot` | Per-table `definition_hash`, `content_hash`, `object_fingerprint`, `pg_table_name` |
+| `hypha.column_snapshot` | Per-column DuckDB→Postgres type mapping |
+| `hypha.table_snapshot` | Per-table row count and `table_hash` |
+| `hypha.row_hash` | Per-row `(pk_json, row_hash)` pairs for row-level diff |
+| `hypha.event_log` | All operations with level/code/message/details |
+| `hypha.meta` | Config: `metadata_schema_version=3`, `fingerprint_algo=v3`, `hyphasync_version` |
 
 ---
 
-## Testdata & stress infrastructure
+## Known issues / rough edges
 
-| Asset | Script | Role |
-|-------|--------|------|
-| Public samples | `scripts/download-testdata.sh` | TPC-H, FERC/PUDL |
-| `frankenstein.duckdb` | `scripts/build-frankenstein.sh` | Multi-schema type coverage |
-| `cheminformatics.duckdb` | `scripts/build-cheminformatics.sh` | Domain-scale tox/chem |
-| `hts-pipeline.duckdb` | `scripts/build-hts.sh` | HTS well/DR firehose |
-| Results | `testdata/results/*.jsonl` | Benchmark history |
+### 1. Postgres 8 KB row limit for wide fixed-width tables
 
-`testdata/` is git-ignored; create it locally or symlink it to your own storage. The
-repeatable stress run is `./scripts/test-sample-dbs.sh`. Empirical findings from the last
-full run live in [docs/benchmarks.md](benchmarks.md).
+Tables with hundreds of integer/numeric/date columns (e.g. XBRL/FERC-style wide tables) can fail COPY with `row is too big for index` or `ERROR: row is too big`. `SET STORAGE EXTERNAL` only helps for varlena (text/bytea/jsonb) columns — it has no effect on fixed-width columns like `integer` or `numeric`.
+
+**Mitigated in this build:** Before attempting COPY, `hyphasync` estimates the fixed-width row size by summing byte widths of all non-varlena columns. If the estimate exceeds 7,000 bytes, a `TABLE_TOO_WIDE` event is logged at level `warn` to `hypha.event_log` with a description of the estimated row size and a recommendation to split the table or convert fixed-width columns to `text`/`numeric`/`jsonb`. If COPY subsequently fails with `row is too big`, an additional actionable line is printed to stderr:
+
+```
+[hyphasync] TABLE_TOO_WIDE: table 'schema.table' row is too wide for Postgres heap.
+Consider splitting or converting fixed-width columns to text/jsonb.
+```
+
+The COPY attempt still proceeds after the warning (it may succeed if Postgres's actual row overhead stays under 8 KB). Known affected table: `analysis_of_charges...` in ferc60/bacta.
+
+### 2. `hypha_sync()` / `hypha_base_snapshot()` output schema inconsistency
+
+`hypha_sync()` yields a row for each **changed** table; unchanged tables are counted in the summary but not returned as rows. `hypha_base_snapshot()` returns one row per table regardless. This asymmetry can surprise scripts that count output rows. Documented, not yet fixed.
 
 ---
 
-## References
+## Test suite status
 
-- [README](../README.md) — user-facing overview and quick start
-- [docs/functions.md](functions.md) — full SQL surface
-- [docs/fingerprinting.md](fingerprinting.md) — v3 spec
-- [docs/benchmarks.md](benchmarks.md) — empirical benchmark data and lessons
-- [docs/upgrading-duckdb.md](upgrading-duckdb.md) — user upgrade guide
-</content>
-</invoke>
+```
+make test
+# → All tests passed (94 assertions in 1 test case)
+```
+
+Tests cover (DuckDB-only, no Postgres required):
+- Extension loading and `hypha_hello()` smoke test
+- `hypha_doctor()` output format and capability flags
+- Error cases: NULL/empty/unreachable conn string for `hypha_init()`
+- `hypha_target_status()` error cases (unreachable, malformed, no stored target)
+- Empty-table fingerprinting (MUTABLE_ENTITY SQL on zero-row table)
+- UUID PKs, reserved-keyword column names, all-NULL non-PK columns
+- `max_rows_per_table` QuickRowEstimate SQL pattern
+- Fingerprint golden vectors: NULL, INTEGER, VARCHAR, BOOLEAN, UUID, DOUBLE, DATE, TIMESTAMP
+- Multi-field row hash (chr(31) separator)
+- `hypha_help()` — all functions listed, specific function lookup, unknown name
+- Scalar shim error messages for `hypha_base_snapshot()` and `hypha_sync()`
+- `hypha_help()` column-name coverage: `table_name`/`rows_synced` in hypha_sync; `row_count`/`fingerprint_strategy` in hypha_base_snapshot
+- `hypha_help()` return-type annotation: TABLE token and canonical SELECT usage snippet
+- TIMESTAMP_S/MS/NS column types accepted by DuckDB catalog (CREATE/DROP smoke test)
+- `hypha_init()` return type declared as VARCHAR in the function catalog
+- `hypha_drop()` error cases: no stored target (all three overloads); `hypha_help('hypha_drop')` entry
+- `hypha_status()` — returns `''` (empty string) and prints to stderr; no-history line when `hypha` schema absent; `hypha_help('hypha_status')` entry
+
+**Integration test suite** (`./test/integration/run.sh`) — all 94 tests passing (2026-05-31):
+- Happy path: `hypha_init()` → `hypha_base_snapshot()` → `hypha_sync()`
+- Type mapping end-to-end: all Postgres types round-trip
+- Schema evolution: ADD/DROP COLUMN, type change (DROP+CREATE)
+- Composite PK row diff
+- Nested types (LIST/STRUCT/MAP → jsonb)
+- Remote metadata (`hypha.sync_log`, `hypha.object_state`)
+- `max_rows_per_table` skipping real tables
+- Wide tables, large tables (150 k rows), fingerprint strategy selection
+- Network resilience: 10 k-row table with mid-test data change
+
+No Docker required — runs against native Postgres 16 on port 54329.
+
+---
+
+## What is not yet implemented
+
+| Feature | Notes |
+|---------|-------|
+| **Streaming COPY** | **Implemented (2026-05-31).** All three COPY paths (base snapshot, sync full-table, delta row-level) now stream via an in-process `pipe()` + background thread. DuckDB writes CSV to the pipe write-end via `/dev/fd/N`; the reader thread forwards chunks directly to Postgres with `PQputCopyData`. No `/tmp/*.csv` files are written. `sys/stat.h` and all `fopen`/`fread`/`fclose` calls removed. |
+| **Inter-table parallelism** | All tables are processed sequentially. An N-worker pool would give 3–8× speedup on many-table databases. |

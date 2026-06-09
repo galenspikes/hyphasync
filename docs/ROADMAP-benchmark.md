@@ -1,7 +1,4 @@
-# hyphasync — benchmark data & lessons learned
-
-Empirical reference from the last full sample-DB run. Roadmap and current status now live in
-[STATUS.md](STATUS.md); this document is the raw data and analysis behind those decisions.
+# hyphasync — Benchmark Lessons Learned & Roadmap
 
 **Benchmark date:** 2026-05-31  
 **Benchmark scope:** 10 sample databases, fresh Postgres per run, `hypha_base_snapshot()`  

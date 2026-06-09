@@ -132,12 +132,14 @@ int64_t EstimateFixedWidthRowBytes(const std::vector<ColumnDef> &cols) {
 //! Returns true for DuckDB source types that require a ::JSON cast before COPY.
 //! - STRUCT/ROW/MAP: DuckDB CSV export uses single-quote notation, not valid JSON
 //! - T[] / LIST(T): DuckDB CSV export uses "[a, b]" brackets; Postgres expects "{a,b}"
+//! - JSON: included for uniformity — ::JSON is an identity cast on an already-JSON
+//!   column and guarantees the COPY SELECT emits canonical JSON text valid for jsonb.
 //! Casting to JSON produces standard double-quoted JSON accepted by Postgres JSONB.
 bool NeedsJsonCastForCopy(const std::string &duckdb_type) {
 	const auto t = StringUtil::Upper(duckdb_type);
 	return StringUtil::EndsWith(t, "[]") || StringUtil::StartsWith(t, "LIST(") ||
 	       StringUtil::StartsWith(t, "STRUCT(") || StringUtil::StartsWith(t, "ROW(") ||
-	       StringUtil::StartsWith(t, "MAP(");
+	       StringUtil::StartsWith(t, "MAP(") || t == "JSON";
 }
 
 //! Builds the SELECT expression for a COPY (SELECT ...) TO ... statement.
