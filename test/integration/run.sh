@@ -313,7 +313,16 @@ check "plan: idempotent (two distinct completed commits)" \
 # ---------------------------------------------------------------------------
 section "05 — hypha_base_snapshot: full push"
 
-"$DUCKDB" "$DB_FILE" -c "SELECT * FROM hypha_base_snapshot();" > /dev/null
+# Capture stderr (where the human-readable summary goes) to assert the M6 fidelity line.
+_bs_stderr=$("$DUCKDB" "$DB_FILE" -c "SELECT * FROM hypha_base_snapshot();" 2>&1 >/dev/null || true)
+if echo "$_bs_stderr" | grep -qE "base_snapshot complete .* 100% fidelity"; then
+    echo -e "  ${GREEN}PASS${NC}: push: fidelity summary printed (100% on clean push)"
+    PASS=$((PASS + 1))
+else
+    echo -e "  ${RED}FAIL${NC}: push: fidelity summary missing or not 100% on clean push"
+    echo "       Got: $(echo "$_bs_stderr" | grep -i fidelity || echo '<no fidelity line>')"
+    FAIL=$((FAIL + 1))
+fi
 
 check "push: commit marked applied" \
     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.commit WHERE status IN ('applied', 'partial')"
