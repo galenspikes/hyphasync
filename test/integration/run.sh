@@ -651,6 +651,32 @@ check "keyless fallback: TRUNCATE_COPY logged for keyless_log" \
     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='TRUNCATE_COPY' AND message LIKE '%keyless_log%'"
 
 # ---------------------------------------------------------------------------
+# 16 — sync DDL suppresses NOT NULL (parity with base snapshot)
+# ---------------------------------------------------------------------------
+# DuckDB does not enforce NOT NULL on the source, and hyphasync's type coercion /
+# unsupported-column exclusion can introduce NULLs the recreated Postgres table would
+# reject. hypha_base_snapshot() already suppresses NOT NULL on CREATE TABLE; hypha_sync()
+# must do the same on every path that recreates a table, or sync aborts COPY on sparse data.
+section "16 — sync DDL suppresses NOT NULL (parity with base snapshot)"
+
+# NEW table appearing after the base snapshot → exercises the sync NEW-table DDL path.
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE sync_notnull (id INTEGER PRIMARY KEY, label VARCHAR NOT NULL);
+INSERT INTO sync_notnull VALUES (1,'a'),(2,'b');
+SELECT * FROM hypha_sync();
+" > /dev/null
+pg_check "sync NEW: rows landed for newly added table" \
+    "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.sync_notnull" "2"
+pg_check "sync NEW: NOT NULL suppressed on recreated table (label is nullable)" \
+    "SELECT is_nullable FROM information_schema.columns WHERE table_schema='${PG_SCHEMA}' AND table_name='sync_notnull' AND column_name='label'" "YES"
+
+# Type change on an existing table → forces the DROP+CREATE recreate path on sync.
+# scalars.name is NOT NULL in DuckDB; the recreated Postgres column must come back nullable.
+"$DUCKDB" "$DB_FILE" -c "ALTER TABLE scalars ALTER small TYPE BIGINT; SELECT * FROM hypha_sync();" > /dev/null
+pg_check "sync recreate: NOT NULL suppressed after type-change DROP+CREATE (name is nullable)" \
+    "SELECT is_nullable FROM information_schema.columns WHERE table_schema='${PG_SCHEMA}' AND table_name='scalars' AND column_name='name'" "YES"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo
