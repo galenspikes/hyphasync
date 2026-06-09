@@ -46,6 +46,7 @@ All standard scalar types are mapped. Notable entries:
 
 - `TIMESTAMP_S` / `TIMESTAMP_MS` / `TIMESTAMP_NS` → `timestamp without time zone` (logged as `TYPE_COERCE` event)
 - `LIST(T)` / `T[]` / `STRUCT(...)` / `MAP(...)` → `jsonb` (requires `json` extension loaded in DuckDB)
+- `JSON` → `jsonb` — first-class: exact per-row fingerprinting (tag `J`) and `::JSON`-cast COPY; requires `json` extension
 - `HUGEINT` → `numeric(39,0)`, `UBIGINT` → `numeric(20,0)`
 - Unsupported types → column excluded; logged as event; rest of table syncs normally
 

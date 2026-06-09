@@ -37,7 +37,7 @@ SELECT hypha_doctor();
 | `metadata_schema_version` | `2` | Internal schema layout version |
 | `fingerprint_algo` | `v3` | Active hashing algorithm |
 | `capability_*` | `available` | One line per function confirming it is wired up |
-| `nested_types` | `LIST/STRUCT/MAP → jsonb (requires json extension)` | Summary of compound type support |
+| `nested_types` | `LIST/STRUCT/MAP/JSON → jsonb (requires json extension)` | Summary of compound type support |
 | `schema_evolution` | `ADD/DROP COLUMN without DROP+CREATE when possible` | Schema change behaviour |
 | `remote_metadata` | `hypha.sync_log and hypha.object_state written after each push` | Bookkeeping on target |
 | `row_level_diff` | `targeted DELETE+INSERT for single and composite PKs` | Row sync strategy |
@@ -150,7 +150,7 @@ SELECT hypha_base_snapshot_plan();
 **Purpose:** Walks the local DuckDB catalog and captures a full snapshot into local `hypha.*` metadata tables — without connecting to Postgres. Computes SHA-256 fingerprints for every table.
 
 **What it does:**
-1. Automatically installs and loads the `json` extension (needed for LIST/STRUCT/MAP fingerprinting)
+1. Automatically installs and loads the `json` extension (needed for LIST/STRUCT/MAP/JSON fingerprinting)
 2. Enumerates all non-internal, non-temporary tables in the current database (excluding the `hypha` schema itself)
 3. For each table: captures columns into `hypha.column_snapshot`, computes `table_hash` + `definition_hash` + `object_fingerprint`, captures per-row hashes into `hypha.row_hash` (for PK tables)
 4. Detects primary key columns (single and composite) for row-level diff
@@ -175,7 +175,7 @@ SELECT hypha_base_snapshot_plan();
 **event_log codes:**
 - `OK` — all tables fingerprinted
 - `HASH_SKIP` — one or more tables could not be fingerprinted (unsupported type, missing json extension if offline); table is still captured with NULL hashes
-- `JSON_EXT_MISSING` — json extension unavailable and nested columns are present (auto-install attempted but failed)
+- `JSON_EXT_MISSING` — *documented but not currently emitted in code*; a missing `json` extension when nested/JSON columns are present surfaces through the generic `HASH_SKIP` path instead
 
 **No Postgres writes.** Safe to call multiple times — each call creates a new commit row without affecting prior commits.
 

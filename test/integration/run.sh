@@ -257,13 +257,14 @@ CREATE TABLE nested_table (
     id     INTEGER PRIMARY KEY,
     tags   VARCHAR[],
     meta   STRUCT(source VARCHAR, ver INT),
-    props  MAP(VARCHAR, VARCHAR)
+    props  MAP(VARCHAR, VARCHAR),
+    doc    JSON
 );
 INSERT INTO scalars VALUES (1,'alice',9.5,99.99,true,now(),now(),'2026-01-01'::DATE,gen_random_uuid(),'\xDEAD'::BLOB,'1 day',1,1,1000000);
 INSERT INTO no_pk_table VALUES (1,'a'),(2,'b');
 INSERT INTO nested_table VALUES
-    (1, ['x','y'], {source:'api',ver:1}, map {'k':'v'}),
-    (2, ['z'],     {source:'db',ver:2},  map {'a':'b','c':'d'});
+    (1, ['x','y'], {source:'api',ver:1}, map {'k':'v'}, '{\"a\":1,\"b\":[2,3]}'),
+    (2, ['z'],     {source:'db',ver:2},  map {'a':'b','c':'d'}, NULL);
 SELECT hypha_base_snapshot_plan();
 " > /dev/null
 
@@ -294,6 +295,13 @@ check "type: PK column is NOT NULL"     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.
 check "type: VARCHAR[] → jsonb"   "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='tags' AND postgres_type='jsonb'"
 check "type: STRUCT → jsonb"      "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='meta' AND postgres_type='jsonb'"
 check "type: MAP → jsonb"         "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='props' AND postgres_type='jsonb'"
+check "type: JSON → jsonb"        "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='doc' AND postgres_type='jsonb'"
+
+# JSON column must NOT demote the table to MUTABLE_ENTITY: a small PK table with a
+# JSON column must classify EXACT (proves FieldEncodingExpr handles tag 'J' and the
+# table is not silently falling into the in-place-edit blind spot).
+check "fingerprint: JSON-bearing table classified EXACT (not MUTABLE_ENTITY)" \
+    "SELECT fingerprint_strategy='EXACT' FROM hypha.table_snapshot WHERE table_name='nested_table' ORDER BY rowid DESC LIMIT 1"
 
 # Idempotency: second plan call creates new commit
 "$DUCKDB" "$DB_FILE" -c "SELECT hypha_base_snapshot_plan();" > /dev/null
@@ -330,6 +338,14 @@ pg_check_contains "Postgres: nested meta is valid jsonb" \
     "SELECT meta->>'source' FROM integration_test_main.nested_table WHERE id=1" "api"
 pg_check_contains "Postgres: nested props is valid jsonb" \
     "SELECT props->>'k' FROM integration_test_main.nested_table WHERE id=1" "v"
+pg_check "Postgres: JSON doc column is jsonb" \
+    "SELECT COUNT(*)::INT FROM information_schema.columns WHERE table_schema='integration_test_main' AND table_name='nested_table' AND column_name='doc' AND data_type='jsonb'" "1"
+pg_check_contains "Postgres: JSON doc round-trips into jsonb" \
+    "SELECT doc->>'a' FROM integration_test_main.nested_table WHERE id=1" "1"
+pg_check_contains "Postgres: JSON nested array round-trips" \
+    "SELECT doc->'b'->>1 FROM integration_test_main.nested_table WHERE id=1" "3"
+pg_check "Postgres: NULL JSON lands as NULL" \
+    "SELECT COUNT(*)::INT FROM integration_test_main.nested_table WHERE id=2 AND doc IS NULL" "1"
 pg_check "Postgres: no_pk_table exists and has data" \
     "SELECT COUNT(*)::INT FROM integration_test_main.no_pk_table" "2"
 
@@ -395,6 +411,18 @@ check "sync: no-PK insert-only uses KEYLESS_APPEND fast path" \
     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='KEYLESS_APPEND'"
 check "sync: tables_truncate_copy reported in sync note" \
     "SELECT (SELECT commit_id FROM hypha.commit WHERE kind='sync' ORDER BY created_at DESC LIMIT 1) IS NOT NULL"
+
+# 06f: in-place edit of a JSON value on a PK table must be detected by the EXACT
+# fingerprint and resynced via the targeted row-level diff (DELETE+INSERT for the
+# changed row only). This is the core regression-proof for first-class JSON support.
+"$DUCKDB" "$DB_FILE" -c "
+UPDATE nested_table SET doc='{\"a\":99,\"b\":[2,3]}' WHERE id=1;
+SELECT * FROM hypha_sync();
+" > /dev/null
+pg_check_contains "sync: in-place JSON edit detected and applied (a: 1 → 99)" \
+    "SELECT doc->>'a' FROM integration_test_main.nested_table WHERE id=1" "99"
+pg_check "sync: untouched JSON row (id=2) still NULL after targeted diff" \
+    "SELECT COUNT(*)::INT FROM integration_test_main.nested_table WHERE id=2 AND doc IS NULL" "1"
 
 # ---------------------------------------------------------------------------
 # 07 — Schema evolution: ADD/DROP COLUMN
