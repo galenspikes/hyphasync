@@ -302,7 +302,7 @@ std::string BuildDoctorReport(Connection &con) {
 	report += "capability_base_snapshot=available\n";
 	report += "capability_sync_plan=available\n";
 	report += "capability_sync=available\n";
-	report += "nested_types=LIST/STRUCT/MAP → jsonb (requires json extension)\n";
+	report += "nested_types=LIST/STRUCT/MAP/JSON → text holding canonical JSON (lossless; requires json extension)\n";
 	report += "schema_evolution=ADD/DROP COLUMN without DROP+CREATE when possible\n";
 	report += "remote_metadata=hypha.sync_log and hypha.object_state written after each push\n";
 	report += "row_level_diff=targeted DELETE+INSERT for single and composite PKs\n";

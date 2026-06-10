@@ -176,7 +176,13 @@ std::string DuckTypeToPostgres(const std::string &raw) {
 		return "uuid";
 	}
 	if (t == "JSON") {
-		return "jsonb";
+		// Lossless mapping: Postgres jsonb/json cannot store a NUL (U+0000), which a JSON string
+		// may legitimately contain. DuckDB's canonical ::JSON::VARCHAR serialization renders any
+		// NUL as a 6-character ASCII escape (no raw NUL byte), so storing that text in a Postgres
+		// `text` column is byte-exact lossless and never trips the jsonb parser's NUL rejection.
+		// A consumer can cast a NUL-free value to jsonb on demand. (This mirrors how DuckDB's own
+		// postgres extension represents Postgres json/jsonb as VARCHAR.)
+		return "text";
 	}
 	if (t == "BIT" || t == "BITSTRING") {
 		return "bit varying";
@@ -201,18 +207,21 @@ std::string DuckTypeToPostgres(const std::string &raw) {
 		return "numeric";
 	}
 
-	// All compound/nested types map to JSONB.
+	// All compound/nested types map to Postgres `text` holding canonical JSON.
 	// DuckDB's CSV export for arrays uses "[a, b]" bracket format which is NOT compatible
-	// with Postgres's "{a,b}" array literal format in COPY FROM. Mapping to JSONB and using
-	// a ::JSON cast in COPY avoids this mismatch for all compound types.
+	// with Postgres's "{a,b}" array literal format in COPY FROM, so the COPY SELECT casts
+	// these columns ::JSON to emit standard JSON text. We store that text rather than jsonb
+	// for the same lossless reason as the JSON branch above: a nested value's string field
+	// may contain a NUL (U+0000), which jsonb/json cannot represent but `text` preserves
+	// byte-for-byte (DuckDB serializes the NUL as an ASCII escape, never a raw NUL byte).
 	if (StringUtil::EndsWith(t, "[]") || StringUtil::StartsWith(t, "LIST(")) {
-		return "jsonb";
+		return "text";
 	}
 	if (StringUtil::StartsWith(t, "STRUCT(") || StringUtil::StartsWith(t, "ROW(")) {
-		return "jsonb";
+		return "text";
 	}
 	if (StringUtil::StartsWith(t, "MAP(")) {
-		return "jsonb";
+		return "text";
 	}
 
 	return "(unsupported: " + raw + ")";

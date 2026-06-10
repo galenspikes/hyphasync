@@ -37,7 +37,7 @@ SELECT hypha_doctor();
 | `metadata_schema_version` | `2` | Internal schema layout version |
 | `fingerprint_algo` | `v3` | Active hashing algorithm |
 | `capability_*` | `available` | One line per function confirming it is wired up |
-| `nested_types` | `LIST/STRUCT/MAP/JSON → jsonb (requires json extension)` | Summary of compound type support |
+| `nested_types` | `LIST/STRUCT/MAP/JSON → text holding canonical JSON (lossless; requires json extension)` | Summary of compound type support |
 | `schema_evolution` | `ADD/DROP COLUMN without DROP+CREATE when possible` | Schema change behaviour |
 | `remote_metadata` | `hypha.sync_log and hypha.object_state written after each push` | Bookkeeping on target |
 | `row_level_diff` | `targeted DELETE+INSERT for single and composite PKs` | Row sync strategy |

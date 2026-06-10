@@ -35,7 +35,7 @@ All workflow functions are implemented and end-to-end tested.
 | Incremental sync with fingerprint diff | ✅ |
 | Row-level diff: single and composite PKs | ✅ |
 | No-PK tables | ✅ TRUNCATE+COPY fallback (logged to event_log) |
-| Nested types: LIST/STRUCT/MAP → `jsonb` | ✅ requires `json` extension |
+| Nested types: LIST/STRUCT/MAP/JSON → `text` (lossless canonical JSON) | ✅ requires `json` extension |
 | Targeted schema evolution: ADD/DROP COLUMN without DROP+CREATE | ✅ |
 | Remote `hypha` metadata on Postgres | ✅ `hypha.sync_log` + `hypha.object_state` |
 | tables_failed / rows_failed tracking with WARNING output | ✅ |
@@ -318,8 +318,8 @@ From R, prefer the repo CLI over loading the extension in CRAN `{duckdb}` — se
 | `DATE`, `TIME`, `TIMETZ` | `date`, `time without/with time zone` |
 | `UUID`, `BOOLEAN`, `BLOB` | `uuid`, `boolean`, `bytea` |
 | `INTERVAL`, `BIT` | `interval`, `bit varying` |
-| `JSON` | `jsonb` |
-| `T[]`, `LIST(T)`, `STRUCT(...)`, `MAP(...)` | `jsonb` (requires `json` extension) |
+| `JSON` | `text` (canonical JSON; lossless — preserves NUL (U+0000), which `jsonb` cannot) |
+| `T[]`, `LIST(T)`, `STRUCT(...)`, `MAP(...)` | `text` (canonical JSON; requires `json` extension) |
 
 Columns whose types have no safe mapping are logged to `hypha.event_log` and excluded from the push; the rest of the table syncs normally.
 

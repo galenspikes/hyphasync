@@ -45,8 +45,8 @@ All hashing runs in DuckDB only. Three strategies, selected per-table at snapsho
 All standard scalar types are mapped. Notable entries:
 
 - `TIMESTAMP_S` / `TIMESTAMP_MS` / `TIMESTAMP_NS` → `timestamp without time zone` (logged as `TYPE_COERCE` event)
-- `LIST(T)` / `T[]` / `STRUCT(...)` / `MAP(...)` → `jsonb` (requires `json` extension loaded in DuckDB)
-- `JSON` → `jsonb` — first-class: exact per-row fingerprinting (tag `J`) and `::JSON`-cast COPY; requires `json` extension
+- `LIST(T)` / `T[]` / `STRUCT(...)` / `MAP(...)` → `text` holding canonical JSON (requires `json` extension loaded in DuckDB)
+- `JSON` → `text` (lossless: preserves NUL/U+0000, which `jsonb` cannot) — first-class: exact per-row fingerprinting (tag `J`) and `::JSON`-cast COPY; requires `json` extension
 - `HUGEINT` → `numeric(39,0)`, `UBIGINT` → `numeric(20,0)`
 - Unsupported types → column excluded; logged as event; rest of table syncs normally
 
@@ -137,7 +137,7 @@ Tests cover (DuckDB-only, no Postgres required):
 - Type mapping end-to-end: all Postgres types round-trip
 - Schema evolution: ADD/DROP COLUMN, type change (DROP+CREATE)
 - Composite PK row diff
-- Nested types (LIST/STRUCT/MAP → jsonb)
+- Nested types (LIST/STRUCT/MAP/JSON → text, lossless canonical JSON)
 - Remote metadata (`hypha.sync_log`, `hypha.object_state`)
 - `max_rows_per_table` skipping real tables
 - Wide tables, large tables (150 k rows), fingerprint strategy selection

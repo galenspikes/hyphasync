@@ -264,7 +264,7 @@ CREATE TABLE nested_table (
 INSERT INTO scalars VALUES (1,'alice',9.5,99.99,true,now(),now(),'2026-01-01'::DATE,gen_random_uuid(),'\xDEAD'::BLOB,'1 day',1,1,1000000);
 INSERT INTO no_pk_table VALUES (1,'a'),(2,'b');
 INSERT INTO nested_table VALUES
-    (1, ['x','y'], {source:'api',ver:1}, map {'k':'v'}, '{\"a\":1,\"b\":[2,3],\"textFr\":\"Préparation: contrôle\"}', 'mis à jour'),
+    (1, ['x','y'], {source:'api',ver:1}, map {'k':'v'}, '{\"a\":1,\"b\":[2,3],\"textFr\":\"Préparation\u0000: contrôle\"}', 'mis à jour'),
     (2, ['z'],     {source:'db',ver:2},  map {'a':'b','c':'d'}, NULL, NULL);
 SELECT hypha_base_snapshot_plan();
 " > /dev/null
@@ -303,10 +303,10 @@ check "type: space-named column tracked" \
     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='update notes'"
 
 # Nested type mapping
-check "type: VARCHAR[] → jsonb"   "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='tags' AND postgres_type='jsonb'"
-check "type: STRUCT → jsonb"      "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='meta' AND postgres_type='jsonb'"
-check "type: MAP → jsonb"         "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='props' AND postgres_type='jsonb'"
-check "type: JSON → jsonb"        "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='doc' AND postgres_type='jsonb'"
+check "type: VARCHAR[] → text"     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='tags' AND postgres_type='text'"
+check "type: STRUCT → text"        "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='meta' AND postgres_type='text'"
+check "type: MAP → text"           "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='props' AND postgres_type='text'"
+check "type: JSON → text"          "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='doc' AND postgres_type='text'"
 
 # JSON column must NOT demote the table to MUTABLE_ENTITY: a small PK table with a
 # JSON column must classify EXACT (proves FieldEncodingExpr handles tag 'J' and the
@@ -352,18 +352,22 @@ pg_check "Postgres: nested_table exists" \
     "SELECT COUNT(*)::INT FROM information_schema.tables WHERE table_schema='integration_test_main' AND table_name='nested_table'" "1"
 pg_check "Postgres: nested_table data landed" \
     "SELECT COUNT(*)::INT FROM integration_test_main.nested_table" "2"
-pg_check_contains "Postgres: nested tags is valid jsonb" \
+pg_check_contains "Postgres: nested tags stored as JSON text" \
     "SELECT tags FROM integration_test_main.nested_table WHERE id=1" '"x"'
-pg_check_contains "Postgres: nested meta is valid jsonb" \
-    "SELECT meta->>'source' FROM integration_test_main.nested_table WHERE id=1" "api"
-pg_check_contains "Postgres: nested props is valid jsonb" \
-    "SELECT props->>'k' FROM integration_test_main.nested_table WHERE id=1" "v"
-pg_check "Postgres: JSON doc column is jsonb" \
-    "SELECT COUNT(*)::INT FROM information_schema.columns WHERE table_schema='integration_test_main' AND table_name='nested_table' AND column_name='doc' AND data_type='jsonb'" "1"
-pg_check_contains "Postgres: JSON doc round-trips into jsonb" \
-    "SELECT doc->>'a' FROM integration_test_main.nested_table WHERE id=1" "1"
-pg_check_contains "Postgres: JSON nested array round-trips" \
-    "SELECT doc->'b'->>1 FROM integration_test_main.nested_table WHERE id=1" "3"
+pg_check_contains "Postgres: nested meta castable to jsonb on demand" \
+    "SELECT (meta::jsonb)->>'source' FROM integration_test_main.nested_table WHERE id=1" "api"
+pg_check_contains "Postgres: nested props castable to jsonb on demand" \
+    "SELECT (props::jsonb)->>'k' FROM integration_test_main.nested_table WHERE id=1" "v"
+pg_check "Postgres: JSON doc column is text (lossless)" \
+    "SELECT COUNT(*)::INT FROM information_schema.columns WHERE table_schema='integration_test_main' AND table_name='nested_table' AND column_name='doc' AND data_type='text'" "1"
+# doc (id=1) holds a JSON value whose textFr string contains a NUL (U+0000). jsonb/json
+# cannot store a NUL, so doc is stored as lossless `text`; the value round-trips
+# byte-exactly, including the NUL rendered as its 6-char ASCII escape. A NUL-free value
+# stays jsonb-castable on demand (see the post-update check further below).
+pg_check_contains "Postgres: doc stored as lossless JSON text (round-trips)" \
+    "SELECT doc FROM integration_test_main.nested_table WHERE id=1" "Préparation"
+pg_check_contains "Postgres: doc NUL preserved losslessly (escape kept, row not dropped/failed)" \
+    "SELECT doc FROM integration_test_main.nested_table WHERE id=1" "u0000"
 pg_check "Postgres: NULL JSON lands as NULL" \
     "SELECT COUNT(*)::INT FROM integration_test_main.nested_table WHERE id=2 AND doc IS NULL" "1"
 pg_check "Postgres: no_pk_table exists and has data" \
@@ -440,7 +444,7 @@ UPDATE nested_table SET doc='{\"a\":99,\"b\":[2,3]}' WHERE id=1;
 SELECT * FROM hypha_sync();
 " > /dev/null
 pg_check_contains "sync: in-place JSON edit detected and applied (a: 1 → 99)" \
-    "SELECT doc->>'a' FROM integration_test_main.nested_table WHERE id=1" "99"
+    "SELECT (doc::jsonb)->>'a' FROM integration_test_main.nested_table WHERE id=1" "99"
 pg_check "sync: untouched JSON row (id=2) still NULL after targeted diff" \
     "SELECT COUNT(*)::INT FROM integration_test_main.nested_table WHERE id=2 AND doc IS NULL" "1"
 
