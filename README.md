@@ -56,17 +56,19 @@ All workflow functions are implemented and end-to-end tested.
 
 ### Download a prebuilt binary
 
-Tagged releases ship prebuilt, loadable extension binaries — no compiling required. Grab the one for your platform from the [latest release](https://github.com/galenspikes/hyphasync/releases/latest):
+Tagged releases ship prebuilt, loadable extension binaries — no compiling required. They are built with DuckDB's distribution pipeline (Linux builds run in a manylinux container with statically-linked libpq), so they're portable across distros. Grab the one for your platform from the [latest release](https://github.com/galenspikes/hyphasync/releases/latest):
 
 ```sh
 # Linux x86-64
 curl -L -o hyphasync.duckdb_extension \
-  https://github.com/galenspikes/hyphasync/releases/latest/download/hyphasync-linux-amd64.duckdb_extension
+  https://github.com/galenspikes/hyphasync/releases/latest/download/hyphasync-linux_amd64.duckdb_extension
 
 # macOS Apple Silicon
 curl -L -o hyphasync.duckdb_extension \
-  https://github.com/galenspikes/hyphasync/releases/latest/download/hyphasync-macos-arm64.duckdb_extension
+  https://github.com/galenspikes/hyphasync/releases/latest/download/hyphasync-osx_arm64.duckdb_extension
 ```
+
+`linux_arm64` and `osx_amd64` builds are published on each release too.
 
 The binary is unsigned and tied to a specific DuckDB minor version, so load it into a matching DuckDB with unsigned extensions allowed:
 

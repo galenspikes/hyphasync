@@ -2,8 +2,13 @@ name: Release
 
 # Push a version tag to cut a release with downloadable extension binaries:
 #   git tag v0.1.0 && git push origin v0.1.0
-# Each platform job builds the loadable extension and attaches a
-# platform-named .duckdb_extension to the GitHub Release for the tag.
+#
+# The binaries are built by DuckDB's official distribution pipeline, which runs
+# the Linux builds inside a manylinux container (ancient glibc) and links libpq
+# statically from vcpkg. That makes the binaries portable across distros — a
+# binary built on the GitHub runner's modern glibc would otherwise fail to load
+# on older systems with "GLIBC_2.xx not found". The publish job then attaches
+# them to the GitHub Release for the tag.
 on:
   push:
     tags:
@@ -12,112 +17,58 @@ on:
 permissions:
   contents: write
 
-# The DuckDB version stamped into the extension metadata. Loading requires an
-# EXACT match against the running DuckDB, so this must equal the version of the
-# pinned `duckdb` submodule (same value as MainDistributionPipeline's
-# duckdb_version). Without it, git describe on the tag-less CI submodule falls
-# back to the placeholder v0.0.1 and the binary won't load into real DuckDB.
-env:
-  OVERRIDE_GIT_DESCRIBE: v1.5.2
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  release-linux:
-    name: Build and publish (linux-amd64)
+  # Build portable, correctly-versioned binaries. Same pipeline (and same args)
+  # as MainDistributionPipeline.yml — keep duckdb_version in sync with the
+  # pinned `duckdb` submodule.
+  build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.2
+      ci_tools_version: v1.5-variegata
+      extension_name: hyphasync
+      # Windows is unsupported (Unix-pipe COPY path); WASM has no libpq/sockets.
+      exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw
+      reduced_ci_mode: disabled
+
+  publish:
+    name: Attach binaries to the release
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Pulls every artifact produced by the build job into artifacts/<name>/...
+      # Artifact names look like: hyphasync-v1.5.2-extension-linux_amd64
+      - name: Download built extensions
+        uses: actions/download-artifact@v4
         with:
-          submodules: recursive
+          path: artifacts
 
-      - name: Install libpq and ccache
-        run: sudo apt-get update -qq && sudo apt-get install -y libpq-dev ccache
-
-      - name: Set up build environment
+      - name: Stage platform-named binaries
         run: |
-          MULTI=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo "x86_64-linux-gnu")
-          echo "CMAKE_PREFIX_PATH=/usr" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=/usr/lib/${MULTI}/pkgconfig" >> $GITHUB_ENV
-          echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
-          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
-          echo "CCACHE_DIR=${HOME}/.ccache" >> $GITHUB_ENV
-          echo "DUCKDB_SHA=$(git rev-parse HEAD:duckdb)" >> $GITHUB_ENV
-
-      # Reuse the ccache populated by the CI workflow so release builds are fast.
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-release-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-
-            ccache-${{ runner.os }}-duckdb-
-
-      - name: Build
-        run: |
-          ccache --max-size=2G --zero-stats
-          CC=gcc CXX=g++ make release
-          ccache --show-stats
-
-      - name: Stage binary
-        run: |
-          cp build/release/extension/hyphasync/hyphasync.duckdb_extension \
-             hyphasync-linux-amd64.duckdb_extension
+          mkdir -p dist
+          for art in artifacts/*/; do
+            name=$(basename "$art")
+            # Keep only the per-arch extension artifacts.
+            case "$name" in
+              *-extension-*) arch="${name##*-extension-}" ;;
+              *) continue ;;
+            esac
+            file=$(find "$art" -name 'hyphasync.duckdb_extension' | head -n1)
+            if [ -n "$file" ]; then
+              cp "$file" "dist/hyphasync-${arch}.duckdb_extension"
+              echo "staged dist/hyphasync-${arch}.duckdb_extension"
+            fi
+          done
+          ls -l dist
 
       - name: Publish to release
         uses: softprops/action-gh-release@v2
         with:
-          files: hyphasync-linux-amd64.duckdb_extension
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-
-  release-macos:
-    name: Build and publish (macos-arm64)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install libpq and ccache
-        run: brew install libpq ccache
-
-      - name: Set up build environment
-        run: |
-          LIBPQ="$(brew --prefix libpq)"
-          echo "CMAKE_PREFIX_PATH=${LIBPQ}" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=${LIBPQ}/lib/pkgconfig" >> $GITHUB_ENV
-          echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
-          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
-          echo "CCACHE_DIR=${HOME}/.ccache" >> $GITHUB_ENV
-          echo "DUCKDB_SHA=$(git rev-parse HEAD:duckdb)" >> $GITHUB_ENV
-
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-release-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-
-            ccache-${{ runner.os }}-duckdb-
-
-      - name: Build
-        run: |
-          ccache --max-size=2G --zero-stats
-          make release
-          ccache --show-stats
-
-      - name: Stage binary
-        run: |
-          cp build/release/extension/hyphasync/hyphasync.duckdb_extension \
-             hyphasync-macos-arm64.duckdb_extension
-
-      - name: Publish to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: hyphasync-macos-arm64.duckdb_extension
+          files: dist/*.duckdb_extension
           generate_release_notes: true
           fail_on_unmatched_files: true
