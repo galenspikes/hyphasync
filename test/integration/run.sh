@@ -264,7 +264,7 @@ CREATE TABLE nested_table (
 INSERT INTO scalars VALUES (1,'alice',9.5,99.99,true,now(),now(),'2026-01-01'::DATE,gen_random_uuid(),'\xDEAD'::BLOB,'1 day',1,1,1000000);
 INSERT INTO no_pk_table VALUES (1,'a'),(2,'b');
 INSERT INTO nested_table VALUES
-    (1, ['x','y'], {source:'api',ver:1}, map {'k':'v'}, '{\"textFr\":\"Préparation: contrôle\",\"textDe\":\"Zubereitung\"}', 'mis à jour'),
+    (1, ['x','y'], {source:'api',ver:1}, map {'k':'v'}, '{\"a\":1,\"b\":[2,3],\"textFr\":\"Préparation: contrôle\"}', 'mis à jour'),
     (2, ['z'],     {source:'db',ver:2},  map {'a':'b','c':'d'}, NULL, NULL);
 SELECT hypha_base_snapshot_plan();
 " > /dev/null
