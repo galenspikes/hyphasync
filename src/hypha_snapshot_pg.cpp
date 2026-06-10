@@ -133,8 +133,10 @@ int64_t EstimateFixedWidthRowBytes(const std::vector<ColumnDef> &cols) {
 //! - STRUCT/ROW/MAP: DuckDB CSV export uses single-quote notation, not valid JSON
 //! - T[] / LIST(T): DuckDB CSV export uses "[a, b]" brackets; Postgres expects "{a,b}"
 //! - JSON: included for uniformity — ::JSON is an identity cast on an already-JSON
-//!   column and guarantees the COPY SELECT emits canonical JSON text valid for jsonb.
-//! Casting to JSON produces standard double-quoted JSON accepted by Postgres JSONB.
+//!   column and guarantees the COPY SELECT emits canonical JSON text.
+//! The target Postgres column is `text` (see DuckTypeToPostgres): casting to JSON yields
+//! standard double-quoted JSON text, which lands losslessly in text — including any NUL,
+//! which DuckDB serializes as an ASCII escape (jsonb/json would reject it).
 bool NeedsJsonCastForCopy(const std::string &duckdb_type) {
 	const auto t = StringUtil::Upper(duckdb_type);
 	return StringUtil::EndsWith(t, "[]") || StringUtil::StartsWith(t, "LIST(") ||
@@ -145,7 +147,8 @@ bool NeedsJsonCastForCopy(const std::string &duckdb_type) {
 //! Builds the SELECT expression for a COPY (SELECT ...) TO ... statement.
 //! Always uses an explicit column list (rather than SELECT *) so that:
 //!   - Unsupported columns excluded from `cols` are not included in the CSV.
-//!   - STRUCT/MAP columns (needs_json_cast=true) are cast to JSON for Postgres JSONB import.
+//!   - STRUCT/MAP/LIST/JSON columns (needs_json_cast=true) are cast to JSON so the CSV holds
+//!     canonical JSON text, which is COPY'd into the column's Postgres `text` type losslessly.
 //! Returns a full "SELECT ... FROM schema.table [WHERE filter]" string.
 std::string BuildCopySelectList(const std::string &duckdb_schema, const std::string &table_name,
                                 const std::vector<ColumnDef> &cols, const std::string &where_clause) {
