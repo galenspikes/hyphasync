@@ -10,6 +10,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: true
 
+# Stamp the extension/duckdb build with the real target version. The CI submodule
+# is checked out without tags, so git describe would otherwise default to v0.0.1
+# and the uploaded artifact would refuse to load into a real DuckDB v1.5.2.
+# Must match the pinned `duckdb` submodule version.
+env:
+  OVERRIDE_GIT_DESCRIBE: v1.5.2
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
