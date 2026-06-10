@@ -106,6 +106,13 @@ describes.  This satisfies the **same-engine comparison guarantee** (§2) — bo
 the "rows now" hash and the "rows we last pushed" hash are computed by the same
 DuckDB code path, so format differences never produce false positives.
 
+The byte-length prefix for these payloads is computed with `strlen()` (UTF-8
+byte length), **not** `octet_length(CAST(... AS BLOB))`: DuckDB rejects the
+`VARCHAR → BLOB` cast for any string containing a non-ASCII byte ("Invalid byte
+encountered in STRING -> BLOB conversion"), which would crash fingerprinting of
+JSON holding accented/Unicode text. `strlen()` returns the same byte count for
+ASCII payloads, so this changes no existing ASCII fingerprint.
+
 The `J` encoding is **byte-exact**: it hashes the engine's canonical JSON text
 without additional key-sort or whitespace normalization. Re-reading the same
 stored value is deterministic, so there are no in-engine false positives; the
