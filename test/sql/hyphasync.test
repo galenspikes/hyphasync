@@ -497,16 +497,18 @@ SELECT length(sha256('i(2):42' || chr(31) || 's(5):hello'));
 # ---------------------------------------------------------------------------
 # P3-1b: JSON tag 'J' golden vectors (DuckDB-only)
 # Exercises the exact SQL fragment FieldEncodingExpr emits for a native JSON
-# column: 'J(' || octet_length(CAST((<jp>) AS BLOB)) || '):' || <jp>, where
+# column: 'J(' || strlen(<jp>) || '):' || <jp>, where
 # <jp> = CAST((col)::JSON AS VARCHAR). Byte-exact: hashes the engine's canonical
-# JSON text with no extra key-sort/whitespace normalization.
+# JSON text with no extra key-sort/whitespace normalization. strlen() (not a
+# VARCHAR->BLOB cast) supplies the byte length so non-ASCII JSON hashes instead
+# of erroring; the two agree exactly on ASCII payloads.
 # ---------------------------------------------------------------------------
 require json
 
 # JSON null literal → payload 'null' (4 bytes) → J(4):null. Distinct from SQL NULL.
 query I
 SELECT CASE WHEN ('null'::JSON) IS NULL THEN 'n():'
-       ELSE 'J(' || octet_length(CAST((CAST(('null'::JSON)::JSON AS VARCHAR)) AS BLOB)) || '):' ||
+       ELSE 'J(' || strlen((CAST(('null'::JSON)::JSON AS VARCHAR))) || '):' ||
             (CAST(('null'::JSON)::JSON AS VARCHAR)) END;
 ----
 J(4):null
@@ -514,7 +516,7 @@ J(4):null
 # JSON number scalar: 5 → 1 byte → J(1):5.
 query I
 SELECT CASE WHEN ('5'::JSON) IS NULL THEN 'n():'
-       ELSE 'J(' || octet_length(CAST((CAST(('5'::JSON)::JSON AS VARCHAR)) AS BLOB)) || '):' ||
+       ELSE 'J(' || strlen((CAST(('5'::JSON)::JSON AS VARCHAR))) || '):' ||
             (CAST(('5'::JSON)::JSON AS VARCHAR)) END;
 ----
 J(1):5
@@ -522,15 +524,27 @@ J(1):5
 # JSON string scalar: "hi" serializes with quotes → 4 bytes → J(4):"hi".
 query I
 SELECT CASE WHEN ('"hi"'::JSON) IS NULL THEN 'n():'
-       ELSE 'J(' || octet_length(CAST((CAST(('"hi"'::JSON)::JSON AS VARCHAR)) AS BLOB)) || '):' ||
+       ELSE 'J(' || strlen((CAST(('"hi"'::JSON)::JSON AS VARCHAR))) || '):' ||
             (CAST(('"hi"'::JSON)::JSON AS VARCHAR)) END;
 ----
 J(4):"hi"
 
+# Non-ASCII regression: JSON holding accented/Unicode text must hash, not error.
+# Previously the byte count used CAST(... AS BLOB), which DuckDB rejects on any
+# non-ASCII byte ("Invalid byte encountered in STRING -> BLOB conversion").
+# "Préparation" → the 'é' is 2 UTF-8 bytes, so "Préparation" payload is 14 bytes
+# including the surrounding quotes → J(14):"Préparation".
+query I
+SELECT CASE WHEN ('"Préparation"'::JSON) IS NULL THEN 'n():'
+       ELSE 'J(' || strlen((CAST(('"Préparation"'::JSON)::JSON AS VARCHAR))) || '):' ||
+            (CAST(('"Préparation"'::JSON)::JSON AS VARCHAR)) END;
+----
+J(14):"Préparation"
+
 # SQL NULL JSON → canonical 'n():' (distinct from the JSON `null` literal above).
 query I
 SELECT CASE WHEN (NULL::JSON) IS NULL THEN 'n():'
-       ELSE 'J(' || octet_length(CAST((CAST((NULL::JSON)::JSON AS VARCHAR)) AS BLOB)) || '):' ||
+       ELSE 'J(' || strlen((CAST((NULL::JSON)::JSON AS VARCHAR))) || '):' ||
             (CAST((NULL::JSON)::JSON AS VARCHAR)) END;
 ----
 n():
@@ -539,10 +553,10 @@ n():
 # byte length of the serialized payload (no hard-coded whitespace assumption).
 query I
 SELECT starts_with(enc, 'J(')
-       AND CAST(regexp_extract(enc, 'J\((\d+)\):', 1) AS INTEGER) = octet_length(CAST(payload AS BLOB))
+       AND CAST(regexp_extract(enc, 'J\((\d+)\):', 1) AS INTEGER) = strlen(payload)
 FROM (
     SELECT CAST(('{"a":1,"b":2}'::JSON)::JSON AS VARCHAR) AS payload,
-           'J(' || octet_length(CAST((CAST(('{"a":1,"b":2}'::JSON)::JSON AS VARCHAR)) AS BLOB)) || '):' ||
+           'J(' || strlen((CAST(('{"a":1,"b":2}'::JSON)::JSON AS VARCHAR))) || '):' ||
                (CAST(('{"a":1,"b":2}'::JSON)::JSON AS VARCHAR)) AS enc
 ) __t;
 ----

@@ -33,12 +33,20 @@ std::string Sha256HexViaSql(Connection &con, const std::string &binary_payload) 
 //! Shared SQL emission for the nested/document tags (L, R, M, J).
 //! All four use DuckDB's ::JSON::VARCHAR serialization as a length-prefixed,
 //! NULL-guarded payload. Factored out so the four branches stay byte-identical.
+//!
+//! Byte count: strlen() returns the UTF-8 byte length of the serialized JSON text,
+//! correctly handling multibyte characters (e.g. 'é' = 2 bytes, '—' = 3 bytes). We must
+//! NOT use CAST(... AS BLOB) for the byte count: DuckDB rejects the VARCHAR→BLOB cast for
+//! any string containing a non-ASCII byte ("Invalid byte encountered in STRING -> BLOB
+//! conversion"), so JSON holding accented/Unicode text would fail to hash. strlen() and
+//! the old octet_length(CAST(... AS BLOB)) agree exactly on ASCII payloads, so existing
+//! ASCII fingerprints are unchanged; non-ASCII JSON simply hashes instead of erroring.
 std::string NestedJsonEncoding(const std::string &col_expr, char tag) {
 	const auto jp = "CAST((" + col_expr + ")::JSON AS VARCHAR)";
 	return std::string("CASE WHEN (") + col_expr +
 	       ") IS NULL THEN 'n():'"
 	       " ELSE '" +
-	       tag + "(' || octet_length(CAST((" + jp + ") AS BLOB)) || '):' || (" + jp + ") END";
+	       tag + "(' || strlen((" + jp + ")) || '):' || (" + jp + ") END";
 }
 
 } // namespace
@@ -236,8 +244,8 @@ std::string FieldEncodingExpr(const std::string &col_expr, const std::string &du
 	//
 	// All four share an identical emission shape, so they route through the shared
 	// NestedJsonEncoding() helper to guarantee no copy-paste drift. NULL-guarded; the
-	// byte-length prefix uses octet_length(CAST(... AS BLOB)) so multibyte JSON text
-	// is counted in bytes.
+	// byte-length prefix uses strlen() so multibyte JSON text is counted in bytes
+	// without the VARCHAR->BLOB cast that DuckDB rejects on non-ASCII input.
 	// ---------------------------------------------------------------------------
 
 	// LIST / ARRAY: tag 'L', payload = JSON array string.
