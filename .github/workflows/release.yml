@@ -9,10 +9,14 @@ name: Release
 # binary built on the GitHub runner's modern glibc would otherwise fail to load
 # on older systems with "GLIBC_2.xx not found". The publish job then attaches
 # them to the GitHub Release for the tag.
+# A tag push cuts a real GitHub Release. A manual run (Actions → Release → Run
+# workflow) just builds the portable binaries and leaves them as downloadable
+# run artifacts — handy for grabbing a one-off build without tagging.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,9 +40,12 @@ jobs:
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw
       reduced_ci_mode: disabled
 
+  # Only tag pushes attach to a Release. On a manual run the build artifacts are
+  # downloadable from the run page, so there's nothing to publish.
   publish:
     name: Attach binaries to the release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       # Pulls every artifact produced by the build job into artifacts/<name>/...

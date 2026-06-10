@@ -73,13 +73,6 @@ jobs:
           CC=gcc CXX=g++ make release
           ccache --show-stats
 
-      - name: Upload extension binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: hyphasync-linux-amd64
-          path: build/release/extension/hyphasync/hyphasync.duckdb_extension
-          if-no-files-found: error
-
       - name: Install format tools
         run: pip install black==26.5.1 clang_format==11.0.1 cmake-format==0.6.13
 
@@ -149,13 +142,6 @@ jobs:
           ccache --max-size=2G --zero-stats
           make release
           ccache --show-stats
-
-      - name: Upload extension binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: hyphasync-macos-arm64
-          path: build/release/extension/hyphasync/hyphasync.duckdb_extension
-          if-no-files-found: error
 
       - name: SQL tests
         run: make test
