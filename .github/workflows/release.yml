@@ -12,6 +12,14 @@ on:
 permissions:
   contents: write
 
+# The DuckDB version stamped into the extension metadata. Loading requires an
+# EXACT match against the running DuckDB, so this must equal the version of the
+# pinned `duckdb` submodule (same value as MainDistributionPipeline's
+# duckdb_version). Without it, git describe on the tag-less CI submodule falls
+# back to the placeholder v0.0.1 and the binary won't load into real DuckDB.
+env:
+  OVERRIDE_GIT_DESCRIBE: v1.5.2
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
