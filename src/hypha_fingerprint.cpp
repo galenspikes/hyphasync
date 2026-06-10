@@ -288,12 +288,16 @@ std::string RowHashExpr(const std::vector<std::pair<std::string, std::string>> &
 
 	// Join field encodings with chr(31) (ASCII unit separator, unlikely in data).
 	// Length prefixes already make concatenation injective; the separator aids readability.
+	// cols[i].first is a bare column name from the catalog (it may contain spaces, reserved
+	// keywords, or other characters needing quoting, e.g. "update notes"), so QuoteIdent() it
+	// before it is inlined into SQL. We keep the bare name in `cols` because ClassifyTable()
+	// matches on it by lowercased text (append-only PK detection).
 	std::string concat;
 	for (size_t i = 0; i < cols.size(); i++) {
 		if (i > 0) {
 			concat += " || chr(31) || ";
 		}
-		concat += "(" + FieldEncodingExpr(cols[i].first, cols[i].second) + ")";
+		concat += "(" + FieldEncodingExpr(QuoteIdent(cols[i].first), cols[i].second) + ")";
 	}
 
 	// sha256() returns VARCHAR lowercase hex in DuckDB.

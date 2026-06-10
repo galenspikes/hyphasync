@@ -258,13 +258,14 @@ CREATE TABLE nested_table (
     tags   VARCHAR[],
     meta   STRUCT(source VARCHAR, ver INT),
     props  MAP(VARCHAR, VARCHAR),
-    doc    JSON
+    doc    JSON,
+    \"update notes\" VARCHAR
 );
 INSERT INTO scalars VALUES (1,'alice',9.5,99.99,true,now(),now(),'2026-01-01'::DATE,gen_random_uuid(),'\xDEAD'::BLOB,'1 day',1,1,1000000);
 INSERT INTO no_pk_table VALUES (1,'a'),(2,'b');
 INSERT INTO nested_table VALUES
-    (1, ['x','y'], {source:'api',ver:1}, map {'k':'v'}, '{\"a\":1,\"b\":[2,3]}'),
-    (2, ['z'],     {source:'db',ver:2},  map {'a':'b','c':'d'}, NULL);
+    (1, ['x','y'], {source:'api',ver:1}, map {'k':'v'}, '{\"textFr\":\"Préparation: contrôle\",\"textDe\":\"Zubereitung\"}', 'mis à jour'),
+    (2, ['z'],     {source:'db',ver:2},  map {'a':'b','c':'d'}, NULL, NULL);
 SELECT hypha_base_snapshot_plan();
 " > /dev/null
 
@@ -290,6 +291,16 @@ check "type: SMALLINT → smallint"       "SELECT COUNT(*)::BIGINT > 0 FROM hyph
 check "type: BIGINT → bigint"           "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE duckdb_type='BIGINT' AND postgres_type='bigint'"
 # NOT NULL preserved
 check "type: PK column is NOT NULL"     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='scalars' AND column_name='id' AND is_nullable=false"
+
+# Regression: fingerprinting must survive a column name with a space ("update notes")
+# and non-ASCII JSON/text content. Before the fix, RowHashExpr inlined the bare column
+# name (Parser Error near "notes") and counted JSON bytes via CAST(... AS BLOB), which
+# DuckDB rejects on non-ASCII bytes. Reaching a non-NULL table_hash for nested_table
+# proves the full per-row EXACT hash ran over both.
+check "fingerprint: space-named column + non-ASCII JSON hashed (no parser/BLOB error)" \
+    "SELECT table_hash IS NOT NULL AND length(table_hash) = 64 FROM hypha.table_snapshot WHERE table_name='nested_table'"
+check "type: space-named column tracked" \
+    "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='update notes'"
 
 # Nested type mapping
 check "type: VARCHAR[] → jsonb"   "SELECT COUNT(*)::BIGINT > 0 FROM hypha.column_snapshot WHERE table_name='nested_table' AND column_name='tags' AND postgres_type='jsonb'"
