@@ -1,0 +1,115 @@
+name: Release
+
+# Push a version tag to cut a release with downloadable extension binaries:
+#   git tag v0.1.0 && git push origin v0.1.0
+# Each platform job builds the loadable extension and attaches a
+# platform-named .duckdb_extension to the GitHub Release for the tag.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-linux:
+    name: Build and publish (linux-amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install libpq and ccache
+        run: sudo apt-get update -qq && sudo apt-get install -y libpq-dev ccache
+
+      - name: Set up build environment
+        run: |
+          MULTI=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo "x86_64-linux-gnu")
+          echo "CMAKE_PREFIX_PATH=/usr" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/${MULTI}/pkgconfig" >> $GITHUB_ENV
+          echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+          echo "CCACHE_DIR=${HOME}/.ccache" >> $GITHUB_ENV
+          echo "DUCKDB_SHA=$(git rev-parse HEAD:duckdb)" >> $GITHUB_ENV
+
+      # Reuse the ccache populated by the CI workflow so release builds are fast.
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-release-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-
+            ccache-${{ runner.os }}-duckdb-
+
+      - name: Build
+        run: |
+          ccache --max-size=2G --zero-stats
+          CC=gcc CXX=g++ make release
+          ccache --show-stats
+
+      - name: Stage binary
+        run: |
+          cp build/release/extension/hyphasync/hyphasync.duckdb_extension \
+             hyphasync-linux-amd64.duckdb_extension
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hyphasync-linux-amd64.duckdb_extension
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  release-macos:
+    name: Build and publish (macos-arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install libpq and ccache
+        run: brew install libpq ccache
+
+      - name: Set up build environment
+        run: |
+          LIBPQ="$(brew --prefix libpq)"
+          echo "CMAKE_PREFIX_PATH=${LIBPQ}" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=${LIBPQ}/lib/pkgconfig" >> $GITHUB_ENV
+          echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+          echo "CCACHE_DIR=${HOME}/.ccache" >> $GITHUB_ENV
+          echo "DUCKDB_SHA=$(git rev-parse HEAD:duckdb)" >> $GITHUB_ENV
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-release-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-duckdb-${{ env.DUCKDB_SHA }}-
+            ccache-${{ runner.os }}-duckdb-
+
+      - name: Build
+        run: |
+          ccache --max-size=2G --zero-stats
+          make release
+          ccache --show-stats
+
+      - name: Stage binary
+        run: |
+          cp build/release/extension/hyphasync/hyphasync.duckdb_extension \
+             hyphasync-macos-arm64.duckdb_extension
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hyphasync-macos-arm64.duckdb_extension
+          generate_release_notes: true
+          fail_on_unmatched_files: true
