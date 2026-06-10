@@ -365,9 +365,9 @@ ORDER BY ordinal_position)",
 						PGExec(pg, "DROP TABLE IF EXISTS " + QuoteIdent(pg_schema) + "." + QuoteIdent(pg_table),
 						       "DROP TABLE IF EXISTS");
 						// suppress_not_null=true for parity with hypha_base_snapshot(): DuckDB does not
-// enforce NOT NULL on the source, and type coercion / excluded columns can yield
-// NULLs that would otherwise abort COPY on the recreated table.
-PGExec(pg, BuildCreateTableDDL(pg_schema, pg_table, cols, pg_names, true), "CREATE TABLE");
+						// enforce NOT NULL on the source, and type coercion / excluded columns can yield
+						// NULLs that would otherwise abort COPY on the recreated table.
+						PGExec(pg, BuildCreateTableDDL(pg_schema, pg_table, cols, pg_names, true), "CREATE TABLE");
 						// Force EXTERNAL storage for text columns.
 						std::string alter;
 						for (size_t ci = 0; ci < cols.size(); ci++) {
@@ -413,9 +413,9 @@ PGExec(pg, BuildCreateTableDDL(pg_schema, pg_table, cols, pg_names, true), "CREA
 							PGExec(pg, "DROP TABLE IF EXISTS " + QuoteIdent(pg_schema) + "." + QuoteIdent(pg_table),
 							       "DROP TABLE IF EXISTS");
 							// suppress_not_null=true for parity with hypha_base_snapshot(): DuckDB does not
-// enforce NOT NULL on the source, and type coercion / excluded columns can yield
-// NULLs that would otherwise abort COPY on the recreated table.
-PGExec(pg, BuildCreateTableDDL(pg_schema, pg_table, cols, pg_names, true), "CREATE TABLE");
+							// enforce NOT NULL on the source, and type coercion / excluded columns can yield
+							// NULLs that would otherwise abort COPY on the recreated table.
+							PGExec(pg, BuildCreateTableDDL(pg_schema, pg_table, cols, pg_names, true), "CREATE TABLE");
 							std::string alter;
 							for (size_t ci = 0; ci < cols.size(); ci++) {
 								if (NeedsExternalStorage(cols[ci].postgres_type)) {
