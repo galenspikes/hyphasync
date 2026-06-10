@@ -18,9 +18,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
-#ifndef _WIN32
 #include <unistd.h>
-#endif
 #include <unordered_map>
 #include <unordered_set>
 
@@ -243,10 +241,26 @@ static void HyphaSnapshotFunction(ClientContext &context, TableFunctionInput &da
 				           ",\"rows_synced\":" + std::to_string(state.rows_synced) +
 				           ",\"rows_failed\":" + std::to_string(state.rows_failed) + "}");
 				state.pg_log.reset();
-				if (state.tables_failed > 0) {
-					Printer::Print(OutputStream::STREAM_STDERR,
-					               "[hyphasync] WARNING: " + std::to_string(state.tables_failed) + " tables failed (" +
-					                   std::to_string(state.rows_failed) + " rows lost)");
+				// Always emit a fidelity summary so operators see landed-vs-lost at a glance,
+				// without digging through hypha.event_log. Silent partial pushes (some tables
+				// failing COPY while the run "succeeds") are the single most dangerous failure
+				// mode for a sync tool, so this line is printed on every run, success or not.
+				{
+					const int64_t rows_attempted = state.rows_synced + state.rows_failed;
+					const int fidelity_pct =
+					    (rows_attempted > 0) ? (int)((state.rows_synced * 100) / rows_attempted) : 100;
+					std::string fid = "[hyphasync] base_snapshot complete · " + std::to_string(fidelity_pct) +
+					                  "% fidelity · " + std::to_string(state.tables_synced) + "/" +
+					                  std::to_string(state.tables_synced + state.tables_failed) + " tables · " +
+					                  std::to_string(state.rows_synced) + " rows";
+					if (state.skipped_count > 0) {
+						fid += " · " + std::to_string(state.skipped_count) + " skipped (max_rows)";
+					}
+					if (state.tables_failed > 0) {
+						fid += " · WARNING " + std::to_string(state.tables_failed) + " tables FAILED, " +
+						       std::to_string(state.rows_failed) + " rows lost — see hypha.event_log";
+					}
+					Printer::Print(OutputStream::STREAM_STDERR, fid);
 				}
 				try {
 					Exec(con,

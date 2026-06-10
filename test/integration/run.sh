@@ -313,7 +313,16 @@ check "plan: idempotent (two distinct completed commits)" \
 # ---------------------------------------------------------------------------
 section "05 — hypha_base_snapshot: full push"
 
-"$DUCKDB" "$DB_FILE" -c "SELECT * FROM hypha_base_snapshot();" > /dev/null
+# Capture stderr (where the human-readable summary goes) to assert the M6 fidelity line.
+_bs_stderr=$("$DUCKDB" "$DB_FILE" -c "SELECT * FROM hypha_base_snapshot();" 2>&1 >/dev/null || true)
+if echo "$_bs_stderr" | grep -qE "base_snapshot complete .* 100% fidelity"; then
+    echo -e "  ${GREEN}PASS${NC}: push: fidelity summary printed (100% on clean push)"
+    PASS=$((PASS + 1))
+else
+    echo -e "  ${RED}FAIL${NC}: push: fidelity summary missing or not 100% on clean push"
+    echo "       Got: $(echo "$_bs_stderr" | grep -i fidelity || echo '<no fidelity line>')"
+    FAIL=$((FAIL + 1))
+fi
 
 check "push: commit marked applied" \
     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.commit WHERE status IN ('applied', 'partial')"
@@ -649,6 +658,35 @@ pg_check "keyless fallback: update propagated via full re-copy" \
     "SELECT payload FROM ${PG_SCHEMA}.keyless_log WHERE seqno=50" "changed"
 check "keyless fallback: TRUNCATE_COPY logged for keyless_log" \
     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.event_log WHERE code='TRUNCATE_COPY' AND message LIKE '%keyless_log%'"
+
+# ---------------------------------------------------------------------------
+# 16 — sync DDL suppresses NOT NULL (parity with base snapshot)
+# ---------------------------------------------------------------------------
+# DuckDB does not enforce NOT NULL on the source, and hyphasync's type coercion /
+# unsupported-column exclusion can introduce NULLs the recreated Postgres table would
+# reject. hypha_base_snapshot() already suppresses NOT NULL on CREATE TABLE; hypha_sync()
+# must do the same on every path that recreates a table, or sync aborts COPY on sparse data.
+section "16 — sync DDL suppresses NOT NULL (parity with base snapshot)"
+
+# Self-contained table with NOT NULL columns, created fresh after the base snapshot.
+# A NEW table appearing on sync exercises the sync NEW-table DDL path.
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE sync_notnull (id INTEGER PRIMARY KEY, label VARCHAR NOT NULL, n SMALLINT NOT NULL);
+INSERT INTO sync_notnull VALUES (1,'a',1),(2,'b',2);
+SELECT * FROM hypha_sync();
+" > /dev/null
+pg_check "sync NEW: rows landed for newly added table" \
+    "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.sync_notnull" "2"
+pg_check "sync NEW: NOT NULL suppressed on recreated table (label is nullable)" \
+    "SELECT is_nullable FROM information_schema.columns WHERE table_schema='${PG_SCHEMA}' AND table_name='sync_notnull' AND column_name='label'" "YES"
+
+# Type change (SMALLINT → BIGINT) forces the DROP+CREATE recreate path on the next sync.
+# The other NOT NULL column (label) must come back nullable on the recreated table.
+"$DUCKDB" "$DB_FILE" -c "ALTER TABLE sync_notnull ALTER n TYPE BIGINT; SELECT * FROM hypha_sync();" > /dev/null
+pg_check "sync recreate: rows preserved after type-change DROP+CREATE" \
+    "SELECT COUNT(*)::INT FROM ${PG_SCHEMA}.sync_notnull" "2"
+pg_check "sync recreate: NOT NULL suppressed after type-change DROP+CREATE (label is nullable)" \
+    "SELECT is_nullable FROM information_schema.columns WHERE table_schema='${PG_SCHEMA}' AND table_name='sync_notnull' AND column_name='label'" "YES"
 
 # ---------------------------------------------------------------------------
 # Summary

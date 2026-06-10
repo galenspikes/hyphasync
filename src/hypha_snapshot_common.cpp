@@ -21,12 +21,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
-#ifndef _WIN32
 #include <unistd.h>
-#else
-#include <io.h>
-#include <fcntl.h>
-#endif
 #include <unordered_map>
 #include <unordered_set>
 
@@ -55,11 +50,7 @@ unique_ptr<MaterializedQueryResult> Exec(Connection &con, const std::string &sql
 //! and then throws an IOException; the caller should proceed directly to ROLLBACK.
 int64_t CopyChunkViaPipe(Connection &con, PGconn *pg, const std::string &select_sql, const char *context) {
 	int fds[2];
-#ifdef _WIN32
-	if (_pipe(fds, 65536, _O_BINARY) != 0) {
-#else
 	if (::pipe(fds) != 0) {
-#endif
 		PQputCopyEnd(pg, "pipe creation failed");
 		throw IOException(std::string(context) + ": pipe() failed");
 	}
@@ -71,31 +62,18 @@ int64_t CopyChunkViaPipe(Connection &con, PGconn *pg, const std::string &select_
 	// Runs concurrently with the DuckDB COPY write below.
 	std::thread reader([&]() {
 		char buf[65536];
-#ifdef _WIN32
-		int n;
-		while ((n = _read(fds[0], buf, sizeof(buf))) > 0) {
-#else
 		ssize_t n;
 		while ((n = ::read(fds[0], buf, sizeof(buf))) > 0) {
-#endif
 			bytes_sent += n;
 			if (!send_failed && PQputCopyData(pg, buf, static_cast<int>(n)) != 1) {
 				send_failed = true;
 				// Drain remaining data so DuckDB does not block on a full pipe buffer.
-#ifdef _WIN32
-				while (_read(fds[0], buf, sizeof(buf)) > 0) {
-#else
 				while (::read(fds[0], buf, sizeof(buf)) > 0) {
-#endif
 				}
 				break;
 			}
 		}
-#ifdef _WIN32
-		_close(fds[0]);
-#else
 		::close(fds[0]);
-#endif
 	});
 
 	const std::string dev_fd = "/dev/fd/" + std::to_string(fds[1]);
@@ -108,11 +86,7 @@ int64_t CopyChunkViaPipe(Connection &con, PGconn *pg, const std::string &select_
 		duckdb_ex = std::current_exception();
 	}
 	// Closing the write-end signals EOF to the reader thread.
-#ifdef _WIN32
-	_close(fds[1]);
-#else
 	::close(fds[1]);
-#endif
 	reader.join();
 
 	if (duckdb_ex) {
