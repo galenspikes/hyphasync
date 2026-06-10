@@ -122,12 +122,12 @@ Distribution builds (`MainDistributionPipeline.yml`) are **manual-only** via wor
 |---|------|-----------|--------------|
 | M1 | **Re-run and baseline sample-DB harness** | Prove fidelity post-fixes; establish comparable JSONL history in `testdata/results/` | `scripts/test-sample-dbs.sh`, frankenstein + tpch-sf1 + one FERC DB |
 | M2 | **Add sample-DB smoke to CI (nightly or weekly)** | Catch TABLE_FAIL regressions on real schemas | New workflow or scheduled job; download TPC-H only for PR-sized runs |
-| M3 | **Suppress NOT NULL on sync DDL** | Parity with base snapshot; fixes XBRL COPY aborts on schema-changed tables | `hypha_snapshot_sync.cpp` → `BuildCreateTableDDL(..., true)` |
+| M3 | ✅ **DONE — Suppress NOT NULL on sync DDL** | Parity with base snapshot; fixes XBRL COPY aborts on schema-changed tables | `hypha_snapshot_sync.cpp` → `BuildCreateTableDDL(..., true)` (both NEW + recreate paths) |
 | M4 | **Set configurable `memory_limit` before plan** | Cap RSS on 200+ table catalogs | `hypha_snapshot_plan.cpp` or `hypha_init` option |
 | M5 | **Implement dynamic chunk sizing** | Prevent OOM on wide/blob tables; reduce round-trips on narrow tables | `hypha_snapshot_common.cpp`, design in [dynamic-chunk-sizing.md](dynamic-chunk-sizing.md) |
-| M6 | **Fidelity summary in CLI output** | Operators must not dig through `event_log` to learn 68% of rows are missing | stderr summary + optional aggregate row on `hypha_base_snapshot()` completion |
+| M6 | ✅ **DONE — Fidelity summary in CLI output** | Operators must not dig through `event_log` to learn 68% of rows are missing | always-on stderr summary on `hypha_base_snapshot()` completion |
 | M7 | **Make fingerprint benchmark blocking** | Remove `continue-on-error: true` once baseline is stable on CI runners | `.github/workflows/ci.yml` |
-| M8 | **Integration test: sync after sparse NULL data** | Lock NOT NULL suppression behavior | `test/integration/run.sh` new section |
+| M8 | ✅ **DONE — Integration test: sync after sparse NULL data** | Lock NOT NULL suppression behavior | `test/integration/run.sh` section 16 |
 
 ### Should-haves (quality bar for “1.0”)
 
@@ -255,6 +255,7 @@ hypha_snapshot.cpp        — registration, hypha_drop, hypha_status
 
 | Doc | Purpose |
 |-----|---------|
+| [TODO.md](TODO.md) | Running actionable checklist (current state of M#/S#/N# items) |
 | [functions.md](functions.md) | SQL surface reference |
 | [fingerprinting.md](fingerprinting.md) | v3 hashing spec |
 | [ROADMAP-benchmark.md](ROADMAP-benchmark.md) | May 2026 benchmark postmortem (historical; verify against current code) |
