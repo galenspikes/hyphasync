@@ -1,5 +1,10 @@
 # hyphasync — current project status
 
+> **⚠️ ARCHIVED — historical snapshot (2026-05-31).** Superseded by
+> [../PROJECT_STATUS_AND_RECOMMENDATIONS.md](../PROJECT_STATUS_AND_RECOMMENDATIONS.md) (status)
+> and the public [../../functions.md](../../functions.md) (function reference). Kept for history;
+> not maintained.
+
 **Date:** 2026-05-31  
 **Build pin:** DuckDB `v1.5.2` · Fingerprint algo `v3` · Metadata schema version `3`  
 **Test result:** `All tests passed (94 assertions in 1 test case)` — `make test`

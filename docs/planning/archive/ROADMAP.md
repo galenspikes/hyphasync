@@ -1,5 +1,9 @@
 # hyphasync roadmap
 
+> **⚠️ ARCHIVED — historical.** Superseded by the live
+> [../PROJECT_STATUS_AND_RECOMMENDATIONS.md](../PROJECT_STATUS_AND_RECOMMENDATIONS.md) (canonical
+> status + roadmap) and [../TODO.md](../TODO.md). Kept for history; not maintained.
+
 **Status: experimental.** The sync pipeline is implemented end-to-end; quality validation on real workloads comes before new features or release packaging.
 
 **Last reviewed:** 2026-06-07  
@@ -9,7 +13,7 @@
 
 ## Canonical planning doc
 
-**→ [PROJECT_STATUS_AND_RECOMMENDATIONS.md](PROJECT_STATUS_AND_RECOMMENDATIONS.md)** — current status, gaps, prioritized must-haves / nice-to-haves, milestones, and concrete next steps. Read this first.
+**→ [PROJECT_STATUS_AND_RECOMMENDATIONS.md](../PROJECT_STATUS_AND_RECOMMENDATIONS.md)** — current status, gaps, prioritized must-haves / nice-to-haves, milestones, and concrete next steps. Read this first.
 
 Historical detail:
 
@@ -33,7 +37,7 @@ Prove correctness on real sample databases → close scale/operability gaps → 
 | **B — Scale it** | Worker pool, interleaved plan+copy, runtime config | 3× faster on many-table DBs; bounded RSS |
 | **C — Ship it** | Signed binaries, stable client story | Distribution pipeline on tag; 1.0.0 |
 
-Full task breakdown: [PROJECT_STATUS_AND_RECOMMENDATIONS.md](PROJECT_STATUS_AND_RECOMMENDATIONS.md).
+Full task breakdown: [PROJECT_STATUS_AND_RECOMMENDATIONS.md](../PROJECT_STATUS_AND_RECOMMENDATIONS.md).
 
 ---
 
@@ -49,7 +53,7 @@ Full task breakdown: [PROJECT_STATUS_AND_RECOMMENDATIONS.md](PROJECT_STATUS_AND_
 
 **Supported today:** `./build/release/duckdb` built from this repo (hyphasync linked in).
 
-**Not supported:** `LOAD hyphasync` from CRAN `{duckdb}` or other mismatched DuckDB versions. When R integration matters, plan is a CLI wrapper — see [r.md](r.md).
+**Not supported:** `LOAD hyphasync` from CRAN `{duckdb}` or other mismatched DuckDB versions. When R integration matters, plan is a CLI wrapper — see [r.md](../../r.md).
 
 ---
 
@@ -76,13 +80,13 @@ Full task breakdown: [PROJECT_STATUS_AND_RECOMMENDATIONS.md](PROJECT_STATUS_AND_
 | libpq | system / Homebrew / vcpkg overlay |
 | Postgres (tests) | 16; port 54329 (native preferred, Docker fallback) |
 
-Bump procedure: [UPDATING.md](UPDATING.md). User guide: [upgrading-duckdb.md](upgrading-duckdb.md).
+Bump procedure: [UPDATING.md](../../UPDATING.md). User guide: [upgrading-duckdb.md](../../upgrading-duckdb.md).
 
 ---
 
 ## References
 
-- [PROJECT_STATUS_AND_RECOMMENDATIONS.md](PROJECT_STATUS_AND_RECOMMENDATIONS.md) — **start here**
-- [functions.md](functions.md) — SQL surface
-- [fingerprinting.md](fingerprinting.md) — v3 spec
-- [upgrading-duckdb.md](upgrading-duckdb.md) — user upgrade guide
+- [PROJECT_STATUS_AND_RECOMMENDATIONS.md](../PROJECT_STATUS_AND_RECOMMENDATIONS.md) — **start here**
+- [functions.md](../../functions.md) — SQL surface
+- [fingerprinting.md](../../fingerprinting.md) — v3 spec
+- [upgrading-duckdb.md](../../upgrading-duckdb.md) — user upgrade guide

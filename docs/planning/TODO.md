@@ -4,7 +4,10 @@ A living checklist of actionable work. Item IDs (M#, S#, N#) and full rationale 
 [PROJECT_STATUS_AND_RECOMMENDATIONS.md](PROJECT_STATUS_AND_RECOMMENDATIONS.md) — this file
 is just the running state so nothing gets lost between sessions.
 
-**Last updated:** 2026-06-10
+**Last updated:** 2026-06-11
+
+> Maintained on the `develop` branch under `docs/planning/`. The public `main` branch does
+> not carry this directory — see [planning/README.md](README.md).
 
 ---
 
@@ -53,8 +56,9 @@ Pull detail from the canonical doc when starting any of these.
 - [ ] **S2** — interleave plan + COPY per table to bound RSS on wide catalogs.
 - [ ] **S5** — keyset pagination for composite / non-integer PKs (kill the OFFSET O(n²) cliff).
 - [ ] **S7** — runtime config API (`hypha_set`/`hypha_get`: copy_chunk_mb, memory_limit, workers).
-- [ ] **Phase C** — re-enable distribution pipeline on tag, extension signing, registry
-  publish, R/processx CLI wrapper, version bump to 1.0.0, CHANGELOG/CONTRIBUTING.
+- [ ] **Phase C** — tagged-release binary pipeline is in place (`release.yml`); remaining:
+  R/processx CLI wrapper, version bump to 1.0.0, CHANGELOG/CONTRIBUTING. (Extension signing /
+  community-extensions registry publish is a **non-goal** — the downloadable binary is enough.)
 
 ---
 
