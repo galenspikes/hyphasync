@@ -529,6 +529,26 @@ check "large table: table_hash computed for big_table" \
 check "large table: object_snapshot entry present" \
     "SELECT COUNT(*)::BIGINT > 0 FROM hypha.object_snapshot WHERE object_name='big_table'"
 
+# Explicit classifier assertions (docs/fingerprinting.md §6.4). Refresh the plan so
+# hypha.table_snapshot.fingerprint_strategy reflects the latest classification.
+"$DUCKDB" "$DB_FILE" -c "SELECT hypha_base_snapshot_plan();" > /dev/null
+
+# big_table: integer 'id' column + 150k rows (≈3 MB > 1 MB EXACT budget) → APPEND_ONLY.
+check "classify: big_table → APPEND_ONLY (integer id signal, over EXACT byte budget)" \
+    "SELECT fingerprint_strategy='APPEND_ONLY' FROM hypha.table_snapshot WHERE table_name='big_table' ORDER BY rowid DESC LIMIT 1"
+
+# A large table with NO id/seq/timestamp signal column → MUTABLE_ENTITY (rowid stats).
+# 60k rows × ~55 bytes ≈ 3.3 MB > 1 MB budget, and 'n'/'payload' match no append signal.
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE mutable_demo AS SELECT range AS n, random()::VARCHAR AS payload FROM range(60000);
+SELECT hypha_base_snapshot_plan();
+" > /dev/null
+check "classify: mutable_demo → MUTABLE_ENTITY (no signal column, over EXACT byte budget)" \
+    "SELECT fingerprint_strategy='MUTABLE_ENTITY' FROM hypha.table_snapshot WHERE table_name='mutable_demo' ORDER BY rowid DESC LIMIT 1"
+
+# Drop the demo table before later sync sections so it is never pushed to Postgres.
+"$DUCKDB" "$DB_FILE" -c "DROP TABLE mutable_demo;" > /dev/null
+
 # ---------------------------------------------------------------------------
 # 11 — max_rows_per_table guard
 # ---------------------------------------------------------------------------
