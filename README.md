@@ -414,7 +414,9 @@ Extension-owned schema: `hypha`
 
 ## Roadmap
 
-Experimental — quality and large-workload validation come before new features or release packaging. See [docs/PROJECT_STATUS_AND_RECOMMENDATIONS.md](docs/PROJECT_STATUS_AND_RECOMMENDATIONS.md) (summary index: [docs/ROADMAP.md](docs/ROADMAP.md)).
+Experimental — correctness and large-workload validation come before new features or release packaging. Detailed status, gaps, and the prioritized task list are maintained on the `develop` branch (under `docs/planning/`); this branch tracks what ships.
+
+Distribution is by **downloadable per-platform binaries** attached to each tagged [release](https://github.com/galenspikes/hyphasync/releases) — load them with `--unsigned` (above). Publishing to DuckDB's community-extensions registry is a non-goal.
 
 If you upgrade DuckDB later: [docs/upgrading-duckdb.md](docs/upgrading-duckdb.md). For day-to-day use, prefer the repo-built `./build/release/duckdb` CLI over loading the extension into CRAN `{duckdb}`.
 
