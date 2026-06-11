@@ -4,6 +4,15 @@
 
 This is a C++ DuckDB extension (`hyphasync`). It builds via DuckDB's extension-ci-tools CMake/Make system.
 
+### Branching & docs
+
+- `main` is the **publicly consumable** branch: `README.md` + public reference docs in `docs/`.
+- `develop` carries planning/roadmap/status/design under `docs/planning/` — **kept off `main`**.
+- Edit roadmap/status on `develop` only — its `docs/planning/README.md` explains the model and
+  how to promote public changes to `main`. Don't link public docs into `docs/planning/`.
+- Distribution is downloadable per-platform binaries (`release.yml` on a `v*` tag). Publishing to
+  DuckDB's community-extensions registry is a **non-goal** — load with `--unsigned`.
+
 ### Build & Test commands
 
 | Task | Command |
