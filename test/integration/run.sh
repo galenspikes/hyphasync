@@ -724,6 +724,61 @@ pg_check "sync recreate: NOT NULL suppressed after type-change DROP+CREATE (labe
     "SELECT is_nullable FROM information_schema.columns WHERE table_schema='${PG_SCHEMA}' AND table_name='sync_notnull' AND column_name='label'" "YES"
 
 # ---------------------------------------------------------------------------
+# 17 — Extended classifier strategies: cheminformatics + wide-analytical
+# ---------------------------------------------------------------------------
+# These are large-table fast paths (docs/fingerprinting.md §6.5): each is reached only
+# once a table exceeds the EXACT byte budget, so every demo table here is sized > 1 MB.
+section "17 — extended classifier strategies (cheminformatics + wide)"
+
+# CHEMINFORMATICS_COMPOUNDS: a SMILES/InChI structure column wins over the integer PK.
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE compound_reg AS
+SELECT range AS compound_id, ('C' || repeat('c1ccccc1', 1 + range % 4)) AS canonical_smiles
+FROM range(60000);
+SELECT hypha_base_snapshot_plan();
+" > /dev/null
+check "classify: compound_reg → CHEMINFORMATICS_COMPOUNDS (smiles column, > EXACT budget)" \
+    "SELECT fingerprint_strategy='CHEMINFORMATICS_COMPOUNDS' FROM hypha.table_snapshot WHERE table_name='compound_reg' ORDER BY rowid DESC LIMIT 1"
+
+# CHEMINFORMATICS_ASSAY: a numeric activity column wins; the *_id PK is NOT mistaken for it.
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE assay_results AS
+SELECT range AS activity_id, ((range % 1000) + 0.5)::DECIMAL(14,4) AS activity_value_nm
+FROM range(60000);
+SELECT hypha_base_snapshot_plan();
+" > /dev/null
+check "classify: assay_results → CHEMINFORMATICS_ASSAY (numeric activity column, > EXACT budget)" \
+    "SELECT fingerprint_strategy='CHEMINFORMATICS_ASSAY' FROM hypha.table_snapshot WHERE table_name='assay_results' ORDER BY rowid DESC LIMIT 1"
+
+# WIDE_ANALYTICAL: > 50 columns, no chem/append signal → probe first simple scalars.
+WIDE_COLS=$(for i in $(seq 0 59); do printf 'range+%d AS c%d,' "$i" "$i"; done | sed 's/,$//')
+"$DUCKDB" "$DB_FILE" -c "
+CREATE TABLE wide_demo AS SELECT ${WIDE_COLS} FROM range(3000);
+SELECT hypha_base_snapshot_plan();
+" > /dev/null
+check "classify: wide_demo → WIDE_ANALYTICAL (>50 columns, > EXACT budget)" \
+    "SELECT fingerprint_strategy='WIDE_ANALYTICAL' FROM hypha.table_snapshot WHERE table_name='wide_demo' ORDER BY rowid DESC LIMIT 1"
+
+# These demo tables exist only to assert classification; drop them before the version guard.
+"$DUCKDB" "$DB_FILE" -c "DROP TABLE compound_reg; DROP TABLE assay_results; DROP TABLE wide_demo;" > /dev/null
+
+# ---------------------------------------------------------------------------
+# 18 — fingerprint_algo version guard (refuse to diff across versions)
+# ---------------------------------------------------------------------------
+# docs/fingerprinting.md §8: if the last applied snapshot's fingerprint_algo differs from
+# the running code, sync must refuse and force a fresh baseline rather than diff across
+# incompatible hashes. Simulate a stale baseline by rewriting the stored algo to 'v2'.
+section "18 — fingerprint_algo version guard"
+
+"$DUCKDB" "$DB_FILE" -c "UPDATE hypha.commit SET fingerprint_algo='v2' WHERE fingerprint_algo='v3';" > /dev/null
+check_throws "version guard: stale fingerprint_algo refuses to diff" \
+    "SELECT hypha_sync_plan();" "fingerprint_algo mismatch"
+# Restore the real algo so the run leaves no poisoned baseline behind.
+"$DUCKDB" "$DB_FILE" -c "UPDATE hypha.commit SET fingerprint_algo='v3' WHERE fingerprint_algo='v2';" > /dev/null
+check "version guard: baseline restored to v3 after the guard test" \
+    "SELECT COUNT(*)::BIGINT = 0 FROM hypha.commit WHERE fingerprint_algo='v2'"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo

@@ -331,6 +331,52 @@ bool IsTimestampType(const std::string &t) {
 	       u == "TIMESTAMP WITHOUT TIME ZONE" || u == "TIMESTAMP_S" || u == "TIMESTAMP_MS" || u == "TIMESTAMP_NS";
 }
 
+bool IsNumericType(const std::string &t) {
+	const auto u = StringUtil::Upper(t);
+	return IsIntegerType(u) || u == "DOUBLE" || u == "FLOAT8" || u == "DOUBLE PRECISION" || u == "FLOAT" ||
+	       u == "FLOAT4" || u == "REAL" || u == "DECIMAL" || u == "NUMERIC" || StringUtil::StartsWith(u, "DECIMAL(") ||
+	       StringUtil::StartsWith(u, "NUMERIC(");
+}
+
+// A scalar type that MIN()/MAX() accept and that casts cleanly to VARCHAR — the building
+// block for the statistical (non-hashing) strategies below.
+bool IsSimpleScalarType(const std::string &t) {
+	const auto u = StringUtil::Upper(t);
+	if (IsNumericType(u)) {
+		return true;
+	}
+	return u == "VARCHAR" || u == "TEXT" || u == "STRING" || StringUtil::StartsWith(u, "VARCHAR(") || u == "DATE" ||
+	       IsTimestampType(u) || u == "BOOLEAN" || u == "BOOL" || u == "UUID";
+}
+
+// Case-insensitive substring test (avoids relying on a specific StringUtil API).
+bool NameContains(const std::string &lower_name, const char *needle) {
+	return lower_name.find(needle) != std::string::npos;
+}
+
+// A chemical-structure identity column (SMILES / InChI / molfile). These are large,
+// effectively immutable text blobs that uniquely key a compound; COUNT + MIN/MAX over one
+// detects the append/replace mutations that dominate compound registries without an O(n)
+// per-row hash.
+bool IsCompoundIdColumn(const std::string &name) {
+	const auto n = StringUtil::Lower(name);
+	return NameContains(n, "smiles") || NameContains(n, "inchi") || n == "mol" || n == "molblock" ||
+	       n == "molfile" || StringUtil::EndsWith(n, "_mol");
+}
+
+// A numeric bioactivity/potency endpoint (IC50, EC50, Ki, activity, …). Excludes key
+// columns (`id`, `*_id`) so foreign keys like `bioactivity_type_id` are not mistaken for
+// measurements. Requires a numeric type so AVG() is meaningful.
+bool IsAssayValueColumn(const std::string &name) {
+	const auto n = StringUtil::Lower(name);
+	if (n == "id" || StringUtil::EndsWith(n, "_id")) {
+		return false; // keys, not measurements
+	}
+	return NameContains(n, "ic50") || NameContains(n, "ec50") || NameContains(n, "ac50") || NameContains(n, "cc50") ||
+	       NameContains(n, "pic50") || NameContains(n, "activity") || NameContains(n, "potency") || n == "ki" ||
+	       n == "kd" || StringUtil::EndsWith(n, "_ki") || StringUtil::EndsWith(n, "_kd");
+}
+
 // Estimate average CSV bytes per row from the (name, duckdb_type) column list.
 // Mirrors EstimateCSVBytesPerRow() in hypha_snapshot.cpp but operates on the
 // classifier's column-pair type instead of ColumnDef.
@@ -471,6 +517,45 @@ FingerprintStrategy ClassifyTable(Connection &con, const std::string &schema_nam
 		}
 	}
 
+	// ---- Domain-semantic strategies (Layer 2) ----
+	// Reached only for tables too large for EXACT above, so they never downgrade the
+	// precision of a small table. They detect the append/replace mutation patterns that
+	// dominate chemical registries and HTS assay data far more cheaply than a per-row hash.
+	// A table that newly classifies here (instead of MUTABLE_ENTITY/APPEND_ONLY) simply
+	// produces a different table_hash on its next snapshot, triggering one self-healing
+	// re-sync — never silent divergence — so no fingerprint_algo bump is required.
+
+	// CHEMINFORMATICS_COMPOUNDS: a SMILES/InChI/mol identity column → COUNT + MIN/MAX(id_col).
+	for (const auto &col : cols) {
+		if (IsCompoundIdColumn(col.first)) {
+			const auto qc = QuoteIdent(col.first);
+			return FingerprintStrategy {
+			    "CHEMINFORMATICS_COMPOUNDS",
+			    "SELECT sha256(CAST(COUNT(*) AS VARCHAR) || '|' || "
+			    "COALESCE(CAST(MIN(" +
+			        qc + ") AS VARCHAR), '') || '|' || COALESCE(CAST(MAX(" + qc +
+			        ") AS VARCHAR), '')) AS table_hash, COUNT(*) AS row_count FROM " + QuoteIdent(schema_name) + "." +
+			        QuoteIdent(table_name),
+			    "structure column '" + col.first + "' signals a compound registry (COUNT + MIN/MAX of structure id)"};
+		}
+	}
+
+	// CHEMINFORMATICS_ASSAY: a numeric potency/activity column → COUNT + MIN/MAX/AVG(value_col).
+	for (const auto &col : cols) {
+		if (IsNumericType(col.second) && IsAssayValueColumn(col.first)) {
+			const auto qc = QuoteIdent(col.first);
+			return FingerprintStrategy {
+			    "CHEMINFORMATICS_ASSAY",
+			    "SELECT sha256(CAST(COUNT(*) AS VARCHAR) || '|' || "
+			    "COALESCE(CAST(MIN(" +
+			        qc + ") AS VARCHAR), '') || '|' || COALESCE(CAST(MAX(" + qc +
+			        ") AS VARCHAR), '') || '|' || COALESCE(CAST(AVG(" + qc +
+			        ") AS VARCHAR), '')) AS table_hash, COUNT(*) AS row_count FROM " + QuoteIdent(schema_name) + "." +
+			        QuoteIdent(table_name),
+			    "assay value column '" + col.first + "' signals bioactivity data (COUNT + MIN/MAX/AVG)"};
+		}
+	}
+
 	// APPEND_ONLY: detect a monotonic integer PK column → COUNT + MAX(pk) (O(1)).
 	std::string append_col;
 	std::string append_reason;
@@ -507,6 +592,35 @@ FingerprintStrategy ClassifyTable(Connection &con, const std::string &schema_nam
 		                                "COUNT(*) AS row_count FROM " +
 		                                QuoteIdent(schema_name) + "." + QuoteIdent(table_name),
 		                            append_reason};
+	}
+
+	// WIDE_ANALYTICAL: very wide tables (>50 columns) — hashing every column per row is
+	// expensive and rarely necessary. COUNT + MIN/MAX over the first few simple scalar
+	// columns gives a cheap change signal. Reached only for large tables (small wide tables
+	// already took EXACT). Falls through to MUTABLE_ENTITY if no simple scalar column exists.
+	static constexpr size_t WIDE_COLUMN_THRESHOLD = 50;
+	if (cols.size() > WIDE_COLUMN_THRESHOLD) {
+		std::vector<std::string> probe;
+		for (const auto &col : cols) {
+			if (IsSimpleScalarType(col.second)) {
+				probe.push_back(QuoteIdent(col.first));
+				if (probe.size() == 3) {
+					break;
+				}
+			}
+		}
+		if (!probe.empty()) {
+			std::string expr = "CAST(COUNT(*) AS VARCHAR)";
+			for (const auto &c : probe) {
+				expr += " || '|' || COALESCE(CAST(MIN(" + c + ") AS VARCHAR), '') || '|' || COALESCE(CAST(MAX(" + c +
+				        ") AS VARCHAR), '')";
+			}
+			return FingerprintStrategy {"WIDE_ANALYTICAL",
+			                            "SELECT sha256(" + expr + ") AS table_hash, COUNT(*) AS row_count FROM " +
+			                                QuoteIdent(schema_name) + "." + QuoteIdent(table_name),
+			                            "wide table (" + std::to_string(cols.size()) + " columns) — COUNT + MIN/MAX of " +
+			                                std::to_string(probe.size()) + " probe column(s)"};
+		}
 	}
 
 	// MUTABLE_ENTITY: default — COUNT + MIN/MAX(rowid) via DuckDB zone maps (O(1)).

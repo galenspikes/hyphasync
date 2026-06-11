@@ -207,7 +207,21 @@ Stored in `hypha.object_snapshot.definition_hash`.
 
 ## 6.4 v3 fingerprint strategy classifier (current algorithm)
 
-The classifier picks one of three strategies for each table:
+The classifier assigns each table exactly one strategy. **EXACT is tried first**: when a
+table is small enough that a full per-row sha256 costs < 1 MB, it is both cheap *and*
+blind-spot-free, so it beats every statistical strategy. The remaining strategies are
+large-table fast paths reached only once EXACT is too expensive — a small table is never
+silently downgraded to a less-precise fingerprint. Classification priority (highest first):
+
+1. **EXACT** — estimated bytes < 1 MB.
+2. **CHEMINFORMATICS_COMPOUNDS** — a SMILES/InChI/mol structure column is present.
+3. **CHEMINFORMATICS_ASSAY** — a numeric IC50/EC50/Ki/activity column is present.
+4. **APPEND_ONLY** — a monotonic integer PK or timestamp ordering column is present.
+5. **WIDE_ANALYTICAL** — more than 50 columns.
+6. **MUTABLE_ENTITY** — default.
+
+The structural strategies (EXACT, APPEND_ONLY, MUTABLE_ENTITY) are described below;
+the domain-semantic and wide strategies follow in §6.5.
 
 ### EXACT (estimated bytes < 1 MB)
 
@@ -267,6 +281,54 @@ catches all schema changes regardless.
   `VERIFY_DRIFT` (an in-place change the fast fingerprint would miss — Postgres is stale)
   versus `VERIFY_PENDING` (a change `hypha_sync()` will catch), then advances the baseline.
   Lets the fast path stay fast while still catching blind-spot drift on demand.
+
+## 6.5 Domain-semantic and wide strategies
+
+These are large-table fast paths: each is reached only when EXACT is too expensive, so a
+small table that would hash exactly is never downgraded to one of them.
+
+### CHEMINFORMATICS_COMPOUNDS (a structure-identity column is present)
+
+```sql
+table_hash = sha256(COUNT(*) || '|' || MIN(structure_col) || '|' || MAX(structure_col))
+```
+
+Triggered when a column name contains `smiles` or `inchi`, or is `mol`/`molblock`/`molfile`
+(or `*_mol`). Compound registries are dominated by inserts and structure replacements; the
+structure string is an effectively immutable identity, so `COUNT` + `MIN`/`MAX` over it
+detects those mutations far more cheaply than a full per-row hash.
+
+### CHEMINFORMATICS_ASSAY (a numeric potency/activity column is present)
+
+```sql
+table_hash = sha256(COUNT(*) || '|' || MIN(val) || '|' || MAX(val) || '|' || AVG(val))
+```
+
+Triggered when a **numeric** column name contains `ic50`/`ec50`/`ac50`/`cc50`/`pic50`/
+`activity`/`potency`, or is `ki`/`kd` (or `*_ki`/`*_kd`). Key columns (`id`, `*_id`) are
+excluded so foreign keys like `bioactivity_type_id` are not mistaken for measurements.
+Adding `AVG` to the count/min/max signal catches bulk value revisions that leave the
+extremes unchanged.
+
+### WIDE_ANALYTICAL (> 50 columns)
+
+```sql
+table_hash = sha256(COUNT(*)
+    || MIN(c1) || MAX(c1) || MIN(c2) || MAX(c2) || MIN(c3) || MAX(c3))
+```
+
+For very wide tables, hashing every column of every row is expensive and rarely necessary.
+`COUNT` plus `MIN`/`MAX` over the first three *simple scalar* columns (numeric, text, date,
+timestamp, boolean, uuid) gives a cheap change signal. Falls through to MUTABLE_ENTITY if no
+simple scalar column exists.
+
+### Strategy change is self-healing (no algorithm-version bump)
+
+Adding these strategies changes the `table_hash` formula for tables that newly match them
+(previously MUTABLE_ENTITY / APPEND_ONLY). On the next sync the stored hash (old formula)
+differs from the freshly computed hash (new formula), so the table is re-synced **once** and
+the new baseline is stored — it errs toward a spurious re-sync, never toward silent
+divergence. As with the additive JSON tag, no `fingerprint_algo` bump is required.
 
 ## 7. Comparison hierarchy (how sync uses these)
 

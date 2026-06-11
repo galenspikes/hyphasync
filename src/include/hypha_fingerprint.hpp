@@ -26,17 +26,21 @@ std::string BuildExactTableHashSQL(const std::string &schema_name, const std::st
                                    const std::vector<std::pair<std::string, std::string>> &cols);
 
 // ---------------------------------------------------------------------------
-// Pluggable fingerprint strategy (v3 two-layer classifier)
+// Pluggable fingerprint strategy (v3 classifier)
 //
-// Layer 1 — Structural classifier (fast, schema-driven):
-//   APPEND_ONLY       integer PK / monotonic timestamp column → COUNT + MAX(signal_col)
-//   EXACT             estimated table bytes < 1 MB → full per-row sha256 (cheap, most precise)
-//   MUTABLE_ENTITY    default for large tables → COUNT + MIN/MAX/SUM of internal rowid
-//   WIDE_ANALYTICAL   >50 columns → COUNT + MIN/MAX of first 3 simple scalar columns
+// EXACT is tried first: when a table is small enough that a full per-row sha256 costs
+// < 1 MB, it is both cheap AND blind-spot-free, so it beats every statistical strategy.
+// The remaining strategies are large-table fast paths reached only once EXACT is too
+// expensive — so a small table is never silently downgraded to a less-precise fingerprint.
 //
-// Layer 2 — Domain-semantic strategies (pluggable, highest priority):
-//   CHEMINFORMATICS_COMPOUNDS  smiles/inchi/mol column → COUNT + MIN/MAX(mol_col)
-//   CHEMINFORMATICS_ASSAY      ic50/ec50/ki/activity column → COUNT + MIN/MAX/AVG(assay_col)
+//   EXACT                      estimated table bytes < 1 MB → full per-row sha256 (precise)
+//   CHEMINFORMATICS_COMPOUNDS  smiles/inchi/mol column → COUNT + MIN/MAX(structure_col)
+//   CHEMINFORMATICS_ASSAY      ic50/ec50/ki/activity numeric column → COUNT + MIN/MAX/AVG(col)
+//   APPEND_ONLY                integer PK / monotonic timestamp column → COUNT + MAX(signal_col)
+//   WIDE_ANALYTICAL            >50 columns → COUNT + MIN/MAX of first 3 simple scalar columns
+//   MUTABLE_ENTITY             default for large tables → COUNT + MIN/MAX of internal rowid
+//
+// See docs/fingerprinting.md §6.4 for the full specification and trade-offs.
 // ---------------------------------------------------------------------------
 
 //! A strategy for computing the fingerprint of a specific table instance.
@@ -51,8 +55,8 @@ struct FingerprintStrategy {
 
 //! Classify a table and return the fingerprint strategy to use.
 //! Classification priority (highest first):
-//!   1. Domain signals  — cheminformatics column name patterns (Layer 2)
-//!   2. Small cost      — estimated bytes < 1 MB → EXACT (full per-row hash, cheap)
+//!   1. Small cost      — estimated bytes < 1 MB → EXACT (cheap AND blind-spot-free)
+//!   2. Domain signals  — cheminformatics column name patterns (CHEMINFORMATICS_*)
 //!   3. Append signal   — integer PK / monotonic timestamp → APPEND_ONLY
 //!   4. Wide table      — >50 columns → WIDE_ANALYTICAL
 //!   5. Default         — MUTABLE_ENTITY (rowid statistics)
