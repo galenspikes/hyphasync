@@ -1,9 +1,9 @@
 # hyphasync — project status & recommendations
 
-**Last reviewed:** 2026-06-07  
+**Last reviewed:** 2026-06-11  
 **Version:** `0.2.0` · **DuckDB pin:** `v1.5.2` · **Fingerprint:** `v3` · **Metadata schema:** `3`
 
-This document is the canonical planning reference for where hyphasync stands, what remains risky, and how to get from *experimental* to *production-ready*. It supersedes the stale sections of [ROADMAP.md](ROADMAP.md), [STATUS.md](STATUS.md), and [NEXT.md](NEXT.md) (those files are kept for history but should not be edited independently).
+This document is the canonical planning reference for where hyphasync stands, what remains risky, and how to get from *experimental* to *production-ready*. It is maintained on the `develop` branch alongside [TODO.md](TODO.md); the public `main` branch does not carry `docs/planning/` (see [planning/README.md](README.md)). Earlier point-in-time docs (ROADMAP, STATUS, NEXT, the May benchmark postmortem) have been consolidated here and moved to [archive/](archive/) for history.
 
 ---
 
@@ -13,7 +13,7 @@ hyphasync is a **working vertical slice**: DuckDB → Postgres sync via SHA-256 
 
 The project is **not yet validated at scale**. Benchmark runs against real-world XBRL and multi-hundred-table catalogs showed silent table drops and memory blow-ups; several correctness fixes have landed since those runs, but **the sample-DB harness has not been re-baselined in CI**. Until `./scripts/test-sample-dbs.sh` passes with documented fidelity on frankenstein + at least one large FERC DB, treat every release as experimental.
 
-**The path to “perfect” is:** prove correctness on real workloads → close remaining fidelity/operability gaps → optimize throughput → ship release engineering (signed binaries, stable client story).
+**The path to “perfect” is:** prove correctness on real workloads → close remaining fidelity/operability gaps → optimize throughput → ship release engineering (published per-platform binaries, stable client story).
 
 ---
 
@@ -35,7 +35,7 @@ Shared infrastructure: `hypha_snapshot_common.cpp` (`CopyChunkViaPipe`, type map
 
 ### Fingerprinting v3
 
-Three per-table strategies (EXACT / APPEND_ONLY / MUTABLE_ENTITY) with algorithm-version enforcement across syncs. Spec: [fingerprinting.md](fingerprinting.md).
+Three per-table strategies (EXACT / APPEND_ONLY / MUTABLE_ENTITY) with algorithm-version enforcement across syncs. Spec: [fingerprinting.md](../fingerprinting.md).
 
 ### Correctness fixes already shipped (since May benchmark)
 
@@ -76,7 +76,7 @@ Distribution builds (`MainDistributionPipeline.yml`) are **manual-only** via wor
 
 ### P0 — Correctness & validation (blockers)
 
-1. **Sample-DB fidelity unverified post-fixes.** [ROADMAP-benchmark.md](ROADMAP-benchmark.md) documented ferc714 at ~32% row landing and frankenstein missing 4 tables. Fixes 0a–0c from that doc are largely implemented, but `testdata/results/` is empty in-repo and CI does not run `./scripts/test-sample-dbs.sh`. **Risk: silent TABLE_FAIL regressions on real schemas.**
+1. **Sample-DB fidelity unverified post-fixes.** [archive/ROADMAP-benchmark.md](archive/ROADMAP-benchmark.md) documented ferc714 at ~32% row landing and frankenstein missing 4 tables. Fixes 0a–0c from that doc are largely implemented, but `testdata/results/` is empty in-repo and CI does not run `./scripts/test-sample-dbs.sh`. **Risk: silent TABLE_FAIL regressions on real schemas.**
 
 2. **Sync DDL still enforces NOT NULL.** Base snapshot passes `suppress_not_null=true`; `hypha_snapshot_sync.cpp` calls `BuildCreateTableDDL(...)` without suppression on schema-changed tables. Sparse XBRL data can still abort COPY on sync after schema drift.
 
@@ -102,11 +102,11 @@ Distribution builds (`MainDistributionPipeline.yml`) are **manual-only** via wor
 
 ### P2 — Release & ecosystem
 
-12. **Unsigned extension.** Built `.duckdb_extension` is not registry-signed. External DuckDB requires `--unsigned` or `SET allow_unsigned_extensions=true`.
+12. **Unsigned extension (by design).** Built `.duckdb_extension` is not registry-signed, so external DuckDB requires `--unsigned` or `SET allow_unsigned_extensions=true`. Publishing to DuckDB's community-extensions registry (which would remove this requirement) is a **non-goal** — distribution is via downloadable per-platform binaries.
 
-13. **No stable R/Python client.** [r.md](r.md) documents calling the repo-built CLI; CRAN `{duckdb}` LOAD is explicitly unsupported.
+13. **No stable R/Python client.** [r.md](../r.md) documents calling the repo-built CLI; CRAN `{duckdb}` LOAD is explicitly unsupported.
 
-14. **Distribution pipeline disabled on push.** Cross-platform binaries require manual workflow dispatch.
+14. **No always-green cross-platform binary on every push.** Tagged releases ship per-platform binaries (`release.yml` → GitHub Release on `v*` tag); the full `MainDistributionPipeline.yml` (format/tidy + all archs) is manual-only via `workflow_dispatch`.
 
 15. **Benchmark CI is non-blocking.** Fingerprint perf gate can regress without failing the build.
 
@@ -124,7 +124,7 @@ Distribution builds (`MainDistributionPipeline.yml`) are **manual-only** via wor
 | M2 | **Add sample-DB smoke to CI (nightly or weekly)** | Catch TABLE_FAIL regressions on real schemas | New workflow or scheduled job; download TPC-H only for PR-sized runs |
 | M3 | ✅ **DONE — Suppress NOT NULL on sync DDL** | Parity with base snapshot; fixes XBRL COPY aborts on schema-changed tables | `hypha_snapshot_sync.cpp` → `BuildCreateTableDDL(..., true)` (both NEW + recreate paths) |
 | M4 | **Set configurable `memory_limit` before plan** | Cap RSS on 200+ table catalogs | `hypha_snapshot_plan.cpp` or `hypha_init` option |
-| M5 | **Implement dynamic chunk sizing** | Prevent OOM on wide/blob tables; reduce round-trips on narrow tables | `hypha_snapshot_common.cpp`, design in [dynamic-chunk-sizing.md](dynamic-chunk-sizing.md) |
+| M5 | **Implement dynamic chunk sizing** | Prevent OOM on wide/blob tables; reduce round-trips on narrow tables | `hypha_snapshot_common.cpp`, design in [dynamic-chunk-sizing.md](dynamic-chunk-sizing.md) (same dir) |
 | M6 | ✅ **DONE — Fidelity summary in CLI output** | Operators must not dig through `event_log` to learn 68% of rows are missing | always-on stderr summary on `hypha_base_snapshot()` completion |
 | M7 | **Make fingerprint benchmark blocking** | Remove `continue-on-error: true` once baseline is stable on CI runners | `.github/workflows/ci.yml` |
 | M8 | ✅ **DONE — Integration test: sync after sparse NULL data** | Lock NOT NULL suppression behavior | `test/integration/run.sh` section 16 |
@@ -149,18 +149,18 @@ Distribution builds (`MainDistributionPipeline.yml`) are **manual-only** via wor
 | N2 | ENUM / UNION type mapping | frankenstein completeness |
 | N3 | Progress reporting (% tables, ETA) on long syncs | UX; TableFunction already streams per-table rows |
 | N4 | R/processx CLI wrapper package | Conservative client story per ROADMAP clients section |
-| N5 | DuckDB extension registry publish + signing | Requires distribution pipeline automation |
-| N6 | Adaptive chunk sizing | Defer until per-chunk metrics exist (see dynamic-chunk-sizing.md verdict) |
-| N7 | Object lineage / Postgres COMMENT ON | Metadata polish |
-| N8 | Postgres read replica lag awareness | Detect stale targets before sync |
+| N5 | Adaptive chunk sizing | Defer until per-chunk metrics exist (see dynamic-chunk-sizing.md verdict) |
+| N6 | Object lineage / Postgres COMMENT ON | Metadata polish |
+| N7 | Postgres read replica lag awareness | Detect stale targets before sync |
 
-### Non-goals (unchanged)
+### Non-goals
 
 - CDC / WAL / logical replication
 - Postgres → DuckDB
 - Multi-target or non-Postgres databases
 - Streaming replication
 - Windows (Linux + macOS only — see gap #16)
+- **DuckDB community-extensions / registry distribution + signing.** Distribution is by downloadable per-platform binaries (`release.yml`); loading into external DuckDB uses `--unsigned`. Having the binary is sufficient — registry publishing is explicitly out of scope.
 
 ---
 
@@ -188,12 +188,11 @@ Week 4: M6, M7 (fidelity summary + blocking benchmark)
 
 ### Phase C — Ship it (8–12 weeks)
 
-**Exit criteria:** signed binaries for linux_amd64 + osx_arm64 (Windows is a non-goal — see gap #16); README “stable” banner; R wrapper alpha.
+**Exit criteria:** per-platform binaries published on tag for linux_amd64/arm64 + osx_amd64/arm64 (unsigned, loaded via `--unsigned`; Windows and registry signing are non-goals — see gap #16 and Non-goals); README “stable” banner; R wrapper alpha.
 
-- Re-enable distribution pipeline on tag push
+- Tagged-release binary pipeline (`release.yml`) — **in place**; keep `duckdb_version` in sync with the submodule pin
 - N4 R CLI wrapper
-- N5 registry publish (optional)
-- Version bump to 1.0.0
+- Version bump to 1.0.0; CHANGELOG / CONTRIBUTING
 
 ---
 
@@ -256,14 +255,14 @@ hypha_snapshot.cpp        — registration, hypha_drop, hypha_status
 | Doc | Purpose |
 |-----|---------|
 | [TODO.md](TODO.md) | Running actionable checklist (current state of M#/S#/N# items) |
-| [functions.md](functions.md) | SQL surface reference |
-| [fingerprinting.md](fingerprinting.md) | v3 hashing spec |
-| [ROADMAP-benchmark.md](ROADMAP-benchmark.md) | May 2026 benchmark postmortem (historical; verify against current code) |
 | [dynamic-chunk-sizing.md](dynamic-chunk-sizing.md) | Chunk sizing design (not implemented) |
-| [upgrading-duckdb.md](upgrading-duckdb.md) | Submodule bump guide for users |
-| [UPDATING.md](UPDATING.md) | Maintainer submodule procedure |
-| [r.md](r.md) | R / CRAN guidance |
+| [archive/ROADMAP-benchmark.md](archive/ROADMAP-benchmark.md) | May 2026 benchmark postmortem (historical; verify against current code) |
+| [../functions.md](../functions.md) | SQL surface reference (public) |
+| [../fingerprinting.md](../fingerprinting.md) | v3 hashing spec (public) |
+| [../upgrading-duckdb.md](../upgrading-duckdb.md) | Submodule bump guide for users (public) |
+| [../UPDATING.md](../UPDATING.md) | Maintainer submodule procedure (public) |
+| [../r.md](../r.md) | R / CRAN guidance (public) |
 
 ---
 
-*Generated from codebase review 2026-06-07. Re-review after each Phase exit criteria milestone.*
+*Generated from codebase review 2026-06-07; consolidated and reviewed 2026-06-11. Re-review after each Phase exit criteria milestone.*

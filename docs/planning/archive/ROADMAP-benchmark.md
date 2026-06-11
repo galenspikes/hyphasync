@@ -1,5 +1,9 @@
 # hyphasync — Benchmark Lessons Learned & Roadmap
 
+> **⚠️ ARCHIVED — historical (May 2026 benchmark postmortem).** Consolidated into
+> [../PROJECT_STATUS_AND_RECOMMENDATIONS.md](../PROJECT_STATUS_AND_RECOMMENDATIONS.md).
+> Kept for history; not maintained — verify any claim against current code.
+
 **Benchmark date:** 2026-05-31  
 **Benchmark scope:** 10 sample databases, fresh Postgres per run, `hypha_base_snapshot()`  
 **hyphasync version:** 0.2.0 / DuckDB v1.5.2
