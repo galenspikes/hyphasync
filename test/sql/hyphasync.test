@@ -754,3 +754,282 @@ query I
 SELECT hypha_help('hypha_init') LIKE '%exact_verify%';
 ----
 true
+
+# ---------------------------------------------------------------------------
+# P3-2: DECIMAL canonical normalization (docs/fingerprinting.md §4.2 tag 'd', §11)
+# Mirrors the exact SQL FieldEncodingExpr emits for DECIMAL/NUMERIC:
+#   strip trailing fractional zeros ONLY when a '.' is present, then strip a
+#   dangling '.', then normalize '-0' → '0'. Length prefix counts the normalized
+#   payload. These are the "1.50 == 1.5" sensitivity vectors the spec requires.
+# ---------------------------------------------------------------------------
+
+# 1.50 (DECIMAL(10,2)) → trailing zero stripped → d(3):1.5
+query I
+WITH e AS (SELECT (1.50::DECIMAL(10,2)) AS v)
+SELECT CASE WHEN v IS NULL THEN 'n():'
+       ELSE 'd(' || length(CAST(p AS VARCHAR)) || '):' || p END
+FROM (SELECT v, CASE WHEN norm = '-0' THEN '0' ELSE norm END AS p
+      FROM (SELECT v, CASE WHEN CAST(v AS VARCHAR) LIKE '%.%'
+                           THEN regexp_replace(regexp_replace(CAST(v AS VARCHAR), '0+$', ''), '\.$', '')
+                           ELSE CAST(v AS VARCHAR) END AS norm
+            FROM e));
+----
+d(3):1.5
+
+# 1.50::DECIMAL(10,2) and 1.5::DECIMAL(2,1) are the SAME value at different declared
+# scales: their canonical encodings (and therefore sha256) MUST be identical.
+query I
+WITH norm AS (
+  SELECT v, CASE WHEN CAST(v AS VARCHAR) LIKE '%.%'
+                 THEN regexp_replace(regexp_replace(CAST(v AS VARCHAR), '0+$', ''), '\.$', '')
+                 ELSE CAST(v AS VARCHAR) END AS p
+  FROM (VALUES (1.50::DECIMAL(10,2)), (1.5::DECIMAL(2,1))) t(v)
+)
+SELECT COUNT(DISTINCT sha256('d(' || length(p) || '):' || p)) = 1 FROM norm;
+----
+true
+
+# 0.00 (DECIMAL(10,2)) → all fractional zeros + dangling '.' stripped → d(1):0
+query I
+WITH e AS (SELECT (0.00::DECIMAL(10,2)) AS v)
+SELECT CASE WHEN v IS NULL THEN 'n():'
+       ELSE 'd(' || length(CAST(p AS VARCHAR)) || '):' || p END
+FROM (SELECT v, CASE WHEN norm = '-0' THEN '0' ELSE norm END AS p
+      FROM (SELECT v, CASE WHEN CAST(v AS VARCHAR) LIKE '%.%'
+                           THEN regexp_replace(regexp_replace(CAST(v AS VARCHAR), '0+$', ''), '\.$', '')
+                           ELSE CAST(v AS VARCHAR) END AS norm
+            FROM e));
+----
+d(1):0
+
+# Integer-scale DECIMAL(5,0) 100 has NO decimal point: its trailing zeros are
+# significant and MUST NOT be stripped → d(3):100 (regression guard against '1').
+query I
+WITH e AS (SELECT (100::DECIMAL(5,0)) AS v)
+SELECT CASE WHEN v IS NULL THEN 'n():'
+       ELSE 'd(' || length(CAST(p AS VARCHAR)) || '):' || p END
+FROM (SELECT v, CASE WHEN norm = '-0' THEN '0' ELSE norm END AS p
+      FROM (SELECT v, CASE WHEN CAST(v AS VARCHAR) LIKE '%.%'
+                           THEN regexp_replace(regexp_replace(CAST(v AS VARCHAR), '0+$', ''), '\.$', '')
+                           ELSE CAST(v AS VARCHAR) END AS norm
+            FROM e));
+----
+d(3):100
+
+# ---------------------------------------------------------------------------
+# P3-3: FLOAT/DOUBLE special-value tokens (docs/fingerprinting.md §4.2 tag 'f')
+# NaN → 'nan', +Inf → 'inf', -Inf → '-inf' (±0.0 → '0' already covered above).
+# Mirrors the exact CASE ladder FieldEncodingExpr emits for floating types.
+# ---------------------------------------------------------------------------
+
+query I
+WITH e AS (SELECT ('nan'::DOUBLE) AS v)
+SELECT CASE WHEN v IS NULL THEN 'n():'
+       ELSE 'f(' || length(CAST(p AS VARCHAR)) || '):' || p END
+FROM (SELECT v, CASE WHEN isnan(v) THEN 'nan'
+                     WHEN isinf(v) AND v > 0 THEN 'inf'
+                     WHEN isinf(v) AND v < 0 THEN '-inf'
+                     WHEN v = 0 THEN '0'
+                     ELSE CAST(v AS VARCHAR) END AS p
+      FROM e);
+----
+f(3):nan
+
+query I
+WITH e AS (SELECT ('inf'::DOUBLE) AS v)
+SELECT CASE WHEN v IS NULL THEN 'n():'
+       ELSE 'f(' || length(CAST(p AS VARCHAR)) || '):' || p END
+FROM (SELECT v, CASE WHEN isnan(v) THEN 'nan'
+                     WHEN isinf(v) AND v > 0 THEN 'inf'
+                     WHEN isinf(v) AND v < 0 THEN '-inf'
+                     WHEN v = 0 THEN '0'
+                     ELSE CAST(v AS VARCHAR) END AS p
+      FROM e);
+----
+f(3):inf
+
+query I
+WITH e AS (SELECT ('-inf'::DOUBLE) AS v)
+SELECT CASE WHEN v IS NULL THEN 'n():'
+       ELSE 'f(' || length(CAST(p AS VARCHAR)) || '):' || p END
+FROM (SELECT v, CASE WHEN isnan(v) THEN 'nan'
+                     WHEN isinf(v) AND v > 0 THEN 'inf'
+                     WHEN isinf(v) AND v < 0 THEN '-inf'
+                     WHEN v = 0 THEN '0'
+                     ELSE CAST(v AS VARCHAR) END AS p
+      FROM e);
+----
+f(4):-inf
+
+# ---------------------------------------------------------------------------
+# P3-4: TIMESTAMPTZ UTC normalization (docs/fingerprinting.md §4.2 tag 'z', §11)
+# The same instant expressed in two different zones MUST produce an identical
+# canonical payload (and therefore an identical hash). Reconstruct the payload
+# from epoch_us(), exactly as FieldEncodingExpr does, independent of session TZ.
+# ---------------------------------------------------------------------------
+
+# Canonical payload renders the moment in UTC with the trailing 'Z'.
+query I
+SELECT strftime(make_timestamp(epoch_us(TIMESTAMPTZ '2024-01-15 12:00:00+00')), '%Y-%m-%dT%H:%M:%S')
+       || '.' || lpad(CAST(epoch_us(TIMESTAMPTZ '2024-01-15 12:00:00+00') % 1000000 AS VARCHAR), 6, '0') || 'Z';
+----
+2024-01-15T12:00:00.000000Z
+
+# 12:00:00+00 and 07:00:00-05 are the same instant → identical 'z(len):payload' encoding.
+query I
+WITH tz AS (
+  SELECT TIMESTAMPTZ '2024-01-15 12:00:00+00' AS a,
+         TIMESTAMPTZ '2024-01-15 07:00:00-05' AS b
+)
+SELECT ('z(' || length(pa) || '):' || pa) = ('z(' || length(pb) || '):' || pb)
+FROM (
+  SELECT strftime(make_timestamp(epoch_us(a)), '%Y-%m-%dT%H:%M:%S') || '.' ||
+         lpad(CAST(epoch_us(a) % 1000000 AS VARCHAR), 6, '0') || 'Z' AS pa,
+         strftime(make_timestamp(epoch_us(b)), '%Y-%m-%dT%H:%M:%S') || '.' ||
+         lpad(CAST(epoch_us(b) % 1000000 AS VARCHAR), 6, '0') || 'Z' AS pb
+  FROM tz
+);
+----
+true
+
+# ---------------------------------------------------------------------------
+# P3-5: Type sensitivity (docs/fingerprinting.md §4.2, §11)
+# NULL ('n():') ≠ '' ('s(0):') ≠ 0 ('i(1):0') ≠ false ('b(1):0'): the four
+# canonical tokens are distinct, so their sha256 fingerprints are all distinct.
+# ---------------------------------------------------------------------------
+
+# The four canonical tokens themselves are distinct.
+query I
+WITH toks AS (
+  SELECT
+    (CASE WHEN (NULL::INTEGER) IS NULL THEN 'n():'
+          ELSE 'i(' || length(CAST(CAST(NULL::INTEGER AS VARCHAR) AS VARCHAR)) || '):' || CAST(NULL::INTEGER AS VARCHAR) END) AS t_null,
+    (CASE WHEN ('') IS NULL THEN 'n():' ELSE 's(' || strlen('') || '):' || '' END) AS t_empty,
+    (CASE WHEN (0) IS NULL THEN 'n():'
+          ELSE 'i(' || length(CAST(CAST(0 AS VARCHAR) AS VARCHAR)) || '):' || CAST(0 AS VARCHAR) END) AS t_zero,
+    (CASE WHEN (false) IS NULL THEN 'n():' WHEN (false) THEN 'b(1):1' ELSE 'b(1):0' END) AS t_false
+)
+SELECT t_null = 'n():' AND t_empty = 's(0):' AND t_zero = 'i(1):0' AND t_false = 'b(1):0' FROM toks;
+----
+true
+
+# All four hash distinctly (no canonicalization collision between NULL/''/0/false).
+query I
+WITH toks AS (
+  SELECT
+    (CASE WHEN (NULL::INTEGER) IS NULL THEN 'n():'
+          ELSE 'i(' || length(CAST(CAST(NULL::INTEGER AS VARCHAR) AS VARCHAR)) || '):' || CAST(NULL::INTEGER AS VARCHAR) END) AS t_null,
+    (CASE WHEN ('') IS NULL THEN 'n():' ELSE 's(' || strlen('') || '):' || '' END) AS t_empty,
+    (CASE WHEN (0) IS NULL THEN 'n():'
+          ELSE 'i(' || length(CAST(CAST(0 AS VARCHAR) AS VARCHAR)) || '):' || CAST(0 AS VARCHAR) END) AS t_zero,
+    (CASE WHEN (false) IS NULL THEN 'n():' WHEN (false) THEN 'b(1):1' ELSE 'b(1):0' END) AS t_false
+)
+SELECT COUNT(DISTINCT h) = 4 FROM (
+            SELECT sha256(t_null)  AS h FROM toks
+  UNION ALL SELECT sha256(t_empty)      FROM toks
+  UNION ALL SELECT sha256(t_zero)       FROM toks
+  UNION ALL SELECT sha256(t_false)      FROM toks
+);
+----
+true
+
+# ---------------------------------------------------------------------------
+# P3-6: table_hash order-independence + duplicate (multiset) correctness
+# (docs/fingerprinting.md §6.1, §11). EXACT table_hash =
+#   sha256(string_agg(row_hash, chr(10) ORDER BY row_hash)).
+# Sorting (not XOR) makes it independent of insertion order yet duplicate-correct.
+# _hypha_rh() reproduces the canonical row hash for (id INTEGER, val VARCHAR).
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE MACRO _hypha_rh(id, val) AS sha256(
+    CASE WHEN (id) IS NULL THEN 'n():'
+         ELSE 'i(' || length(CAST(CAST((id) AS VARCHAR) AS VARCHAR)) || '):' || CAST((id) AS VARCHAR) END
+    || chr(31) ||
+    CASE WHEN (val) IS NULL THEN 'n():' ELSE 's(' || strlen((val)) || '):' || (val) END
+);
+
+statement ok
+CREATE TABLE _hypha_ord_a (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO _hypha_ord_a VALUES (1,'a'),(2,'b'),(3,'c');
+
+statement ok
+CREATE TABLE _hypha_ord_b (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO _hypha_ord_b VALUES (3,'c'),(1,'a'),(2,'b');
+
+# Same rows, different insertion order → identical table_hash.
+query I
+SELECT
+  (SELECT sha256(string_agg(_hypha_rh(id,val), chr(10) ORDER BY _hypha_rh(id,val))) FROM _hypha_ord_a)
+  =
+  (SELECT sha256(string_agg(_hypha_rh(id,val), chr(10) ORDER BY _hypha_rh(id,val))) FROM _hypha_ord_b);
+----
+true
+
+statement ok
+DROP TABLE _hypha_ord_a;
+
+statement ok
+DROP TABLE _hypha_ord_b;
+
+# Duplicate (fully identical) rows are a multiset: two copies MUST NOT collapse to one.
+statement ok
+CREATE TABLE _hypha_dup_2 (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO _hypha_dup_2 VALUES (1,'a'),(1,'a');
+
+statement ok
+CREATE TABLE _hypha_dup_1 (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO _hypha_dup_1 VALUES (1,'a');
+
+# [x,x] ≠ [x] — duplicate count is preserved in the hash.
+query I
+SELECT
+  (SELECT sha256(string_agg(_hypha_rh(id,val), chr(10) ORDER BY _hypha_rh(id,val))) FROM _hypha_dup_2)
+  <>
+  (SELECT sha256(string_agg(_hypha_rh(id,val), chr(10) ORDER BY _hypha_rh(id,val))) FROM _hypha_dup_1);
+----
+true
+
+statement ok
+DROP TABLE _hypha_dup_1;
+
+statement ok
+DROP TABLE _hypha_dup_2;
+
+# [x,x,y] == [y,x,x] — duplicate-correct AND order-independent at once.
+statement ok
+CREATE TABLE _hypha_dup_x (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO _hypha_dup_x VALUES (1,'a'),(1,'a'),(2,'b');
+
+statement ok
+CREATE TABLE _hypha_dup_y (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO _hypha_dup_y VALUES (2,'b'),(1,'a'),(1,'a');
+
+query I
+SELECT
+  (SELECT sha256(string_agg(_hypha_rh(id,val), chr(10) ORDER BY _hypha_rh(id,val))) FROM _hypha_dup_x)
+  =
+  (SELECT sha256(string_agg(_hypha_rh(id,val), chr(10) ORDER BY _hypha_rh(id,val))) FROM _hypha_dup_y);
+----
+true
+
+statement ok
+DROP TABLE _hypha_dup_x;
+
+statement ok
+DROP TABLE _hypha_dup_y;
+
+statement ok
+DROP MACRO _hypha_rh;
