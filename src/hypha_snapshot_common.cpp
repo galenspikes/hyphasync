@@ -188,7 +188,34 @@ std::string DuckTypeToPostgres(const std::string &raw) {
 		return "bit varying";
 	}
 
-	// Parameterized types: DECIMAL(p,s) / NUMERIC(p,s) / CHAR(n) / VARCHAR(n)
+	// All compound/nested types map to Postgres `text` holding canonical JSON.
+	//
+	// IMPORTANT: this block MUST come before the parameterized scalar checks below.
+	// An array of a parameterized element type — e.g. "DECIMAL(18,3)[]" or "VARCHAR(64)[]" —
+	// also satisfies StringUtil::StartsWith(t, "DECIMAL(") / "VARCHAR(", so if the scalar
+	// checks ran first they would re-emit it as a Postgres ARRAY type ("numeric(18,3)[]"),
+	// which then breaks COPY: the COPY SELECT casts these columns ::JSON and emits canonical
+	// JSON ("[a,b]"), not a Postgres array literal ("{a,b}"), so Postgres rejects it with
+	// "malformed array literal". Mapping to `text` keeps the JSON payload lossless.
+	//
+	// DuckDB's CSV export for arrays uses "[a, b]" bracket format which is NOT compatible
+	// with Postgres's "{a,b}" array literal format in COPY FROM, so the COPY SELECT casts
+	// these columns ::JSON to emit standard JSON text. We store that text rather than jsonb
+	// for the same lossless reason as the JSON branch above: a nested value's string field
+	// may contain a NUL (U+0000), which jsonb/json cannot represent but `text` preserves
+	// byte-for-byte (DuckDB serializes the NUL as an ASCII escape, never a raw NUL byte).
+	if (StringUtil::EndsWith(t, "[]") || StringUtil::StartsWith(t, "LIST(")) {
+		return "text";
+	}
+	if (StringUtil::StartsWith(t, "STRUCT(") || StringUtil::StartsWith(t, "ROW(")) {
+		return "text";
+	}
+	if (StringUtil::StartsWith(t, "MAP(")) {
+		return "text";
+	}
+
+	// Parameterized scalar types: DECIMAL(p,s) / NUMERIC(p,s) / CHAR(n) / VARCHAR(n).
+	// (Array variants such as "DECIMAL(18,3)[]" are already handled by the nested block above.)
 	if (StringUtil::StartsWith(t, "DECIMAL(") || StringUtil::StartsWith(t, "NUMERIC(")) {
 		// Re-emit as lowercase numeric(p,s)
 		const auto paren = raw.find('(');
@@ -205,23 +232,6 @@ std::string DuckTypeToPostgres(const std::string &raw) {
 	// Plain DECIMAL / NUMERIC without precision
 	if (t == "DECIMAL" || t == "NUMERIC") {
 		return "numeric";
-	}
-
-	// All compound/nested types map to Postgres `text` holding canonical JSON.
-	// DuckDB's CSV export for arrays uses "[a, b]" bracket format which is NOT compatible
-	// with Postgres's "{a,b}" array literal format in COPY FROM, so the COPY SELECT casts
-	// these columns ::JSON to emit standard JSON text. We store that text rather than jsonb
-	// for the same lossless reason as the JSON branch above: a nested value's string field
-	// may contain a NUL (U+0000), which jsonb/json cannot represent but `text` preserves
-	// byte-for-byte (DuckDB serializes the NUL as an ASCII escape, never a raw NUL byte).
-	if (StringUtil::EndsWith(t, "[]") || StringUtil::StartsWith(t, "LIST(")) {
-		return "text";
-	}
-	if (StringUtil::StartsWith(t, "STRUCT(") || StringUtil::StartsWith(t, "ROW(")) {
-		return "text";
-	}
-	if (StringUtil::StartsWith(t, "MAP(")) {
-		return "text";
 	}
 
 	return "(unsupported: " + raw + ")";
